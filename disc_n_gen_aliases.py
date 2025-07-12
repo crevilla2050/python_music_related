@@ -203,65 +203,103 @@ def are_files_similar(file1, file2):
     return similarity > SIMILARITY_THRESHOLD
 
 def find_duplicates(files):
+    # Create an empty set to store the indices of files that have been seen
     seen = set()
+    # Create an empty list to store the groups of duplicate files
     groups = []
+    # Iterate through the list of files
     for i in range(len(files)):
+        # If the current file has already been seen, skip it
         if i in seen:
             continue
+        # Create a new group with the current file
         group = [files[i]]
+        # Iterate through the remaining files
         for j in range(i + 1, len(files)):
+            # If the current file has already been seen, skip it
             if j in seen:
                 continue
+            # If the current file is similar to the previous file, add it to the group and mark it as seen
             if are_files_similar(files[i], files[j]):
                 group.append(files[j])
                 seen.add(j)
+        # If the group contains more than one file, add it to the list of groups and mark the first file as seen
         if len(group) > 1:
             groups.append(group)
             seen.add(i)
+    # Return the list of groups
     return groups
 
 def main():
+    # Set the global variable VERBOSE to False by default
     global VERBOSE
 
+    # Check if the user has provided the correct number of arguments
     if len(sys.argv) < 3:
+        # Print the correct usage of the script
         print("Usage: python disc_n_gen_aliases.py <music_dir> --mode [aliases|duplicates|all] [--verbose]")
+        # Exit the script with a status code of 1
         sys.exit(1)
 
+    # Get the arguments passed to the script
     args = sys.argv[1:]
+    # Get the root directory from the arguments
     root_dir = args[0]
+    # Set the mode to "all" by default
     mode = "all"
+    # Check if the user has provided the --mode argument
     if "--mode" in args:
+        # Get the index of the --mode argument
         mode_index = args.index("--mode")
+        # Check if the --mode argument is followed by a valid mode
         if mode_index + 1 < len(args):
+            # Set the mode to the provided mode
             mode = args[mode_index + 1].lower()
+    # Set the VERBOSE variable to True if the user has provided the --verbose argument
     VERBOSE = "--verbose" in args
 
+    # Print the root directory and mode
     print(f"[*] Scanning directory: {root_dir}")
     print(f"[*] Mode: {mode}")
+    # Check if the VERBOSE variable is True
     if VERBOSE:
+        # Print that the VERBOSE mode is ON
         print("[*] Verbose mode ON")
 
+    # Scan the music files in the root directory
     files, tag_artists, tag_albums = scan_music_files(root_dir)
+    # Scan the folder structure in the root directory
     folder_artists, folder_albums = scan_folder_structure(root_dir)
+    # Merge the variants from the tag and folder structure
     artist_variants = merge_variants(tag_artists, folder_artists)
     album_variants = merge_variants(tag_albums, folder_albums)
 
+    # Check if the mode is "aliases" or "all"
     if mode in ("aliases", "all"):
+        # Print that the artist/album aliases are being generated
         print("[*] Generating artist/album aliases...")
+        # Build the artist/album aliases
         artist_aliases = build_aliases(artist_variants)
         album_aliases = build_aliases(album_variants)
+        # Write the artist/album aliases to a JSON file
         with open("artist_album_aliases.json", "w", encoding="utf-8") as f:
             json.dump({
                 "artist_aliases": artist_aliases,
                 "album_aliases": album_aliases
             }, f, indent=2, ensure_ascii=False)
+        # Print that the aliases have been written to the JSON file
         print(f"[✓] Aliases written to artist_album_aliases.json")
 
+    # Check if the mode is "duplicates" or "all"
     if mode in ("duplicates", "all"):
+        # Print that the duplicate files are being looked for
         print("[*] Looking for duplicate files...")
+        # Find the duplicate files
         dup_groups = find_duplicates(files)
+        # Write the duplicate files to a JSON file
         with open("duplicates.json", "w", encoding="utf-8") as f:
             json.dump(dup_groups, f, indent=2, ensure_ascii=False)
+        # Print that the duplicate files have been written to the JSON file
         print(f"[✓] {len(dup_groups)} duplicate groups written to duplicates.json")
 
 if __name__ == "__main__":
