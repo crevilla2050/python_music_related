@@ -1,3 +1,4 @@
 # Ignore all log and json files
 *.log
 *.json
+*.pyc
