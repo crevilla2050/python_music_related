@@ -18,42 +18,66 @@ def log(msg):
     if VERBOSE:
         print(msg)
 
+# Function to normalize a string
 def normalize_string(s):
+    # Convert the string to lowercase
     s = s.lower()
+    # Normalize the string using Unicode NFKD
     s = unicodedata.normalize('NFKD', s)
+    # Remove any combining characters
     s = ''.join(c for c in s if not unicodedata.combining(c))
+    # Remove any numbers, hyphens, underscores, or periods at the beginning of the string
     s = re.sub(r'^\d+\s*[-._)]*\s*', '', s)
+    # Remove any text within parentheses or brackets
     s = re.sub(r'\(.*?\)|\[.*?\]', '', s)
-    s = re.sub(r'feat\.?.*|ft\.?.*|remastered|live|version', '', s)
+    # Remove any characters that are not letters, numbers, or spaces
     s = re.sub(r'[^a-z0-9 ]+', '', s)
+    # Replace any multiple spaces with a single space
     s = re.sub(r'\s+', ' ', s)
+    # Return the normalized string with any leading or trailing spaces removed
     return s.strip()
 
 def get_tags(filepath):
+    # Try to read the tags from the audio file
     try:
+        # Create an instance of the MutagenFile class with the given filepath
         audio = MutagenFile(filepath, easy=True)
+        # If the audio file is not found, return an empty dictionary
         if not audio:
             return {}
+        # Create a dictionary to store the tags
         tags = {
             "artist": audio.get("artist", [""])[0].strip(),
             "title": audio.get("title", [""])[0].strip(),
             "album": audio.get("album", [""])[0].strip(),
         }
+        # Log the tags for the given filepath
         log(f"  [✓] Tags for {os.path.basename(filepath)}: {tags}")
+        # Return the tags
         return tags
+    # If an exception is raised, log the error and return an empty dictionary
     except Exception as e:
         log(f"  [!] Failed to read tags for {filepath}: {e}")
         return {}
 
 def calculate_hash(filepath, algo='sha256', block_size=65536):
+    # Try to calculate the hash of the file
     try:
+        # Create a new hash object using the specified algorithm
         h = hashlib.new(algo)
+        # Open the file in binary mode
         with open(filepath, 'rb') as f:
+            # Iterate over the file in chunks of the specified block size
             for chunk in iter(lambda: f.read(block_size), b''):
+                # Update the hash object with the chunk
                 h.update(chunk)
+        # Get the hexadecimal representation of the hash
         hash_val = h.hexdigest()
+        # Log the hash value
         log(f"  [✓] Hash for {os.path.basename(filepath)}: {hash_val[:10]}...")
+        # Return the hash value
         return hash_val
+    # If an exception is raised, log the error and return None
     except Exception as e:
         log(f"  [!] Hashing failed for {filepath}: {e}")
         return None

@@ -20,7 +20,7 @@ FAILED_FOLDER = os.path.expanduser("~/FailedMusic")
 SUPPORTED_EXTS = ['.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac']
 
 # MusicBrainz setup
-set_useragent("MusicOrganizer", "1.0", "carlos.revilla.m@gmail.com")
+set_useragent("MusicOrganizer", "1.0", "yourmail@example.com")
 
 # Command-line args
 if len(sys.argv) < 2:
