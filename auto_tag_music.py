@@ -1,117 +1,23 @@
-# auto_tag_music.py
-import os
-import sys
-import json
-import json
-import unicodedata
-import musicbrainzngs
-from mutagen import File as MutagenFile
-
-SUPPORTED_EXTS = ['.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac']
-# Set user agent for MusicBrainz API
-# Replace with your own user agent details
-# It's important to set a user agent to identify your application to the MusicBrainz API.
-# This helps MusicBrainz track usage and provide better service.
-musicbrainzngs.set_useragent("MusicTagger", "1.0", "yourmail@example.com")
-
-# Known aliases mapping for artist normalization
-ARTIST_ALIASES = {
-   # Add more mappings as needed
-}
-
-ALBUM_ALIASES = {
-    # Add album-level normalization if needed
-    # "greatest hits": "Greatest Hits"
-}
-
-ALIAS_FILE = "artist_album_aliases.json"
-LOG_FILE = "auto_tag_music.log"
-
-musicbrainzngs.set_useragent("MusicTagger", "1.0", "yourmail@example.com")
-
-# Load alias maps from JSON
-# Define a function called load_aliases that takes a path as an argument
-def load_aliases(path):
-    # Check if the path exists
-    if os.path.exists(path):
-        # Open the file at the given path in read mode with utf-8 encoding
-        with open(path, "r", encoding="utf-8") as f:
-            # Load the data from the file
-            data = json.load(f)
-            # Return the artist_aliases and album_aliases from the data
-            return data.get("artist_aliases", {}), data.get("album_aliases", {})
-    # If the path does not exist, return empty dictionaries
-    return {}, {}
-
-ARTIST_ALIASES, ALBUM_ALIASES = load_aliases(ALIAS_FILE)
-
-musicbrainzngs.set_useragent("MusicTagger", "1.0", "yourmail@example.com")
-
-# Load alias maps from JSON
-# Define a function called load_aliases that takes a path as an argument
-def load_aliases(path):
-    # Check if the path exists
-    if os.path.exists(path):
-        # Open the file at the given path in read mode with utf-8 encoding
-        with open(path, "r", encoding="utf-8") as f:
-            # Load the data from the file
-            data = json.load(f)
-            # Return the artist_aliases and album_aliases from the data
-            return data.get("artist_aliases", {}), data.get("album_aliases", {})
-    # If the path does not exist, return empty dictionaries
-    return {}, {}
-
-ARTIST_ALIASES, ALBUM_ALIASES = load_aliases(ALIAS_FILE)
-
-def normalize_name(name):
-    # Convert the name to lowercase
-    # Convert the name to lowercase
-    name = name.lower()
-    # Normalize the name to remove any accents or diacritics
-    # Normalize the name to remove any accents or diacritics
-    name = unicodedata.normalize('NFKD', name)
-    # Remove any combining characters
-    # Remove any combining characters
-    name = ''.join(c for c in name if not unicodedata.combining(c))
-    # Remove any non-alphanumeric characters and spaces
-    # Remove any non-alphanumeric characters and spaces
-    name = ''.join(c for c in name if c.isalnum() or c.isspace()).strip()
-    # Return the normalized name
-    # Return the normalized name
-    return name
-
-# Define a function called normalize_artist_name that takes in a parameter called name
-# Define a function called normalize_artist_name that takes in a parameter called name
-def normalize_artist_name(name):
-    # Call the normalize_name function and assign the result to the variable normalized
-    normalized = normalize_name(name)
-    # Return the value of the ARTIST_ALIASES dictionary with the key of normalized, or the title of name if the key is not found
-    return ARTIST_ALIASES.get(normalized, name.title())
-    # Call the normalize_name function and assign the result to the variable normalized
-    normalized = normalize_name(name)
-    # Return the value of the ARTIST_ALIASES dictionary with the key of normalized, or the title of name if the key is not found
-    return ARTIST_ALIASES.get(normalized, name.title())
-
-def normalize_album_name(name):
-    normalized = normalize_name(name)
-    return ALBUM_ALIASES.get(normalized, name.title())
-    normalized = normalize_name(name)
-    return ALBUM_ALIASES.get(normalized, name.title())
-
 def log(message):
+    # Append the log message to the log file and also print it to the console
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(message + "\n")
     print(message)
 
 def fetch_tags_from_musicbrainz(filepath):
+    # Extract filename without extension
     filename = os.path.splitext(os.path.basename(filepath))[0]
+    # Expect filenames in the format "Artist - Title"
     if '-' not in filename:
         return None
+    # Split the filename into artist and title guesses
     artist_guess, title_guess = map(str.strip, filename.split('-', 1))
     try:
+        # Query MusicBrainz for matching recordings
         result = musicbrainzngs.search_recordings(artist=artist_guess, recording=title_guess, limit=1)
         if result['recording-list']:
             rec = result['recording-list'][0]
+            # Extract artist, title, and album information
             artist = rec['artist-credit'][0]['artist']['name']
             title = rec['title']
             album = rec['release-list'][0]['title'] if 'release-list' in rec else 'Unknown Album'
@@ -119,25 +25,30 @@ def fetch_tags_from_musicbrainz(filepath):
                 "artist": artist,
                 "album": album,
                 "title": title,
-                "tracknumber": "00",
+                "tracknumber": "00",  # Default track number
                 "compilation": "1" if len(set(a['artist']['name'] for a in rec['artist-credit'])) > 1 else "0"
             }
     except Exception as e:
+        # Log any errors from MusicBrainz
         log(f"[!] MusicBrainz error for {filepath}: {e}")
     return None
 
 def enrich_tags(filepath):
     try:
+        # Open the audio file using mutagen
         audio = MutagenFile(filepath, easy=True)
         if not audio:
             log(f"[!] Unsupported or unreadable file: {filepath}")
             return False
 
-        needs_update = False
+        needs_update = False  # Track if any tag was updated
+
+        # Read existing tags or fallback to empty strings
         artist = audio.get("artist", [""])[0].strip()
         title = audio.get("title", [""])[0].strip()
         album = audio.get("album", [""])[0].strip()
 
+        # Normalize and update artist tag if needed
         if artist:
             normalized = normalize_artist_name(artist)
             if normalized != artist:
@@ -145,6 +56,7 @@ def enrich_tags(filepath):
                 audio["artist"] = normalized
                 needs_update = True
 
+        # Normalize and update album tag if needed
         if album:
             normalized_album = normalize_album_name(album)
             if normalized_album != album:
@@ -152,14 +64,17 @@ def enrich_tags(filepath):
                 audio["album"] = normalized_album
                 needs_update = True
 
+        # If any key tags are missing, try fetching from MusicBrainz
         if not artist or not title or not album:
             log(f"[*] Missing tags. Trying MusicBrainz for: {filepath}")
             mb_tags = fetch_tags_from_musicbrainz(filepath)
             if mb_tags:
+                # Fill missing tags from MusicBrainz response
                 for key, value in mb_tags.items():
                     if not audio.get(key):
                         audio[key] = value
                         needs_update = True
+                # Normalize MusicBrainz artist and album if needed
                 if mb_tags.get("artist"):
                     normalized = normalize_artist_name(mb_tags["artist"])
                     if normalized != mb_tags["artist"]:
@@ -173,6 +88,7 @@ def enrich_tags(filepath):
                         audio["album"] = normalized_album
                         needs_update = True
 
+        # If anything was changed, save the updated tags
         if needs_update:
             audio.save()
             log(f"[✓] Tags updated: {filepath}")
@@ -182,25 +98,32 @@ def enrich_tags(filepath):
             return False
 
     except Exception as e:
+        # Log any failure during processing
         log(f"[!] Failed to tag {filepath}: {e}")
         return False
 
 def process_directory(root_dir):
+    # Validate that the input is a directory
     if not os.path.isdir(root_dir):
         log(f"[✗] Not a directory: {root_dir}")
         return
 
     log(f"[INFO] Scanning: {root_dir}")
+    # Recursively walk through all files in the directory
     for dirpath, _, filenames in os.walk(root_dir):
         for fname in filenames:
             filepath = os.path.join(dirpath, fname)
             ext = os.path.splitext(fname)[1].lower()
+            # Process only supported audio files
             if ext in SUPPORTED_EXTS:
                 enrich_tags(filepath)
 
+# Script entry point
 if __name__ == "__main__":
+    # Require a directory path as argument
     if len(sys.argv) < 2:
         print("Usage: python auto_tag_music.py <directory>")
         sys.exit(1)
 
+    # Start processing the given directory
     process_directory(sys.argv[1])

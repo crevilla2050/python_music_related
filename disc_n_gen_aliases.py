@@ -98,21 +98,31 @@ def calculate_hash(filepath, algo='sha256', block_size=65536):
         return None
 
 def scan_music_files(root_path):
+    # Initialize a list to store file metadata dictionaries
     files = []
+    # Initialize dictionaries to store variants of artist and album names
     artist_variants = {}
     album_variants = {}
 
+    # Walk through all files in the directory tree rooted at root_path
     for dirpath, _, filenames in os.walk(root_path):
         for fname in filenames:
+            # Get the lowercase file extension
             ext = os.path.splitext(fname)[1].lower()
+            # Skip files with unsupported extensions
             if ext not in SUPPORTED_EXTS:
                 continue
 
+            # Construct the full path of the file
             full_path = os.path.join(dirpath, fname)
+            # Extract tags from the file using Mutagen
             tags = get_tags(full_path)
+            # Compute the SHA-256 hash of the file for content-based comparison
             hash_val = calculate_hash(full_path)
+            # Normalize the filename for fuzzy comparison
             norm_name = normalize_string(fname)
 
+            # Append file data to the list
             files.append({
                 "path": full_path,
                 "name": fname,
@@ -121,71 +131,106 @@ def scan_music_files(root_path):
                 "hash": hash_val
             })
 
+            # Collect all artist name variants (raw and normalized) found in tags
             if tags.get("artist"):
                 norm_artist = normalize_string(tags["artist"])
                 artist_variants.setdefault(norm_artist, set()).add(tags["artist"])
+            # Collect all album name variants (raw and normalized) found in tags
             if tags.get("album"):
                 norm_album = normalize_string(tags["album"])
                 album_variants.setdefault(norm_album, set()).add(tags["album"])
 
+    # Return the collected file data and artist/album variants
     return files, artist_variants, album_variants
 
+
 def scan_folder_structure(root_path):
+    # Initialize dictionaries to store artist and album name variants inferred from folder names
     artist_variants = {}
     album_variants = {}
 
+    # Walk through the folder hierarchy of root_path
     for dirpath, _, _ in os.walk(root_path):
+        # Get the path relative to root_path
         rel_path = os.path.relpath(dirpath, root_path)
+        # Skip the root directory itself
         if rel_path == ".":
             continue
+        # Split the relative path into directory levels (artist/album)
         parts = rel_path.split(os.sep)
+        # If there's only one folder level, treat it as an artist
         if len(parts) == 1 and parts[0].lower() != "collections":
             norm_artist = normalize_string(parts[0])
             artist_variants.setdefault(norm_artist, set()).add(parts[0])
+        # If there are two levels, treat them as artist/album
         if len(parts) == 2:
             norm_album = normalize_string(parts[1])
             album_variants.setdefault(norm_album, set()).add(parts[1])
+            # Also handle the artist part if not under a "collections" folder
             if parts[0].lower() != "collections":
                 norm_artist = normalize_string(parts[0])
                 artist_variants.setdefault(norm_artist, set()).add(parts[0])
 
+    # Return the collected folder-based artist/album variants
     return artist_variants, album_variants
 
+
 def build_aliases(variants_dict, threshold=SIMILARITY_THRESHOLD):
+    # Create a set to keep track of keys we've already processed
     seen = set()
+    # Dictionary to store the final alias mapping
     aliases = {}
+    # Get all normalized keys from the variants dictionary
     keys = list(variants_dict.keys())
 
+    # Iterate through each normalized key
     for i, key in enumerate(keys):
         if key in seen:
             continue
+        # Start a group with the current key
         group = [key]
+        # Use difflib to find similar normalized strings
         matches = difflib.get_close_matches(key, keys, n=10, cutoff=threshold)
         for match in matches:
+            # Avoid reprocessing already-seen keys
             if match != key and match not in seen:
                 group.append(match)
+        # Collect all original variants from the grouped keys
         combined = set()
         for g in group:
             combined.update(variants_dict.get(g, []))
             seen.add(g)
+        # Choose the longest variant as the canonical (more descriptive) name
         canonical = sorted(combined, key=len)[-1]
+        # Map all other variants to the canonical name
         for alias in combined:
             if alias != canonical:
                 aliases[alias] = canonical
+    # Return the dictionary of aliases
     return aliases
 
+
 def merge_variants(dict1, dict2):
+    # Create a copy of dict1 to start with
     merged = dict1.copy()
+    # Iterate over each normalized key and its set of variants in dict2
     for norm, variants in dict2.items():
+        # If the key already exists in the merged dictionary, update the set
         if norm in merged:
             merged[norm].update(variants)
         else:
+            # Otherwise, just add it as a new key
             merged[norm] = set(variants)
+    # Return the combined dictionary of variants
     return merged
 
+
 def are_files_similar(file1, file2):
+    # If hashes are available and match, the files are identical
     if file1['hash'] and file2['hash'] and file1['hash'] == file2['hash']:
         return True
+
+    # Compare metadata tags (artist, title, album) for similarity
     tags1, tags2 = file1["tags"], file2["tags"]
     if tags1 and tags2:
         matches = 0
@@ -195,12 +240,17 @@ def are_files_similar(file1, file2):
             val2 = normalize_string(tags2.get(key, ""))
             if val1 and val2:
                 total += 1
+                # Consider fields matching exactly or with high similarity
                 if val1 == val2 or difflib.SequenceMatcher(None, val1, val2).ratio() > SIMILARITY_THRESHOLD:
                     matches += 1
+        # If at least two out of three tags are similar, consider the files similar
         if total > 0 and matches / total >= 0.66:
             return True
+
+    # As a fallback, compare normalized filenames for similarity
     similarity = difflib.SequenceMatcher(None, file1["norm_name"], file2["norm_name"]).ratio()
     return similarity > SIMILARITY_THRESHOLD
+
 
 def find_duplicates(files):
     # Create an empty set to store the indices of files that have been seen
