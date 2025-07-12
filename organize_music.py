@@ -119,92 +119,135 @@ def load_aliases(json_file):
         log(f"[!] Failed to load alias file: {e}")
         return {}, {}
 
+# Define a function called apply_alias that takes two parameters, name and aliases
 def apply_alias(name, aliases):
+    # Normalize the name using the normalize_name function
     norm = normalize_name(name)
+    # Return the alias if it exists, otherwise return the original name
     return aliases.get(norm, name)
 
 def extract_tags(filepath):
+    # Try to extract tags from the given file
     try:
+        # Create an instance of the MutagenFile class with the given file path
         audio = MutagenFile(filepath, easy=True)
+        # If the audio object is not created, return None
         if not audio:
             return None
+        # Return a dictionary containing the extracted tags
         return {
             "artist": audio.get("artist", ["Unknown Artist"])[0].strip(),
             "album": audio.get("album", ["Unknown Album"])[0].strip(),
             "title": audio.get("title", ["Unknown Title"])[0].strip(),
             "track": audio.get("tracknumber", [""])[0].split("/")[0].strip()
         }
+    # If an exception is raised, log the error and return None
     except Exception as e:
         log(f"[!] Error extracting tags from '{filepath}': {e}")
         return None
 
+# Define a function to get a unique destination path
 def get_unique_dest(dest_path):
+    # Split the destination path into base and extension
     base, ext = os.path.splitext(dest_path)
+    # Initialize a count variable
     count = 1
+    # Loop until a unique path is found
     while os.path.exists(dest_path):
+        # Create a new path with a duplicate suffix
         dest_path = f"{base}_dup{count}{ext}"
+        # Increment the count
         count += 1
+    # Return the unique path
     return dest_path
 
 def organize_file(filepath, target_root, artist_aliases, album_aliases):
+    # Try to extract tags from the file
     try:
         tags = extract_tags(filepath)
+        # If no tags are found, return
         if not tags:
             return
 
+        # Apply aliases to the artist and album names
         artist = apply_alias(tags["artist"], artist_aliases)
         album = apply_alias(tags["album"], album_aliases)
+        # Get the title and track number from the tags
         title = tags["title"]
         track = tags["track"]
 
+        # Create the base directory for the file
         base_dir = os.path.join(target_root, normalize_name(artist), normalize_name(album))
+        # Create the directory if it doesn't exist
         os.makedirs(base_dir, exist_ok=True)
 
+        # Create the filename for the file
         filename = normalize_filename(f"{artist} - {title}{os.path.splitext(filepath)[1]}", track)
+        # Create the destination path for the file
         dest_path = os.path.join(base_dir, filename)
 
+        # Compute the SHA256 hash of the file
         file_hash = compute_sha256(filepath)
+        # If no hash is found, return
         if not file_hash:
             return
 
+        # Check if the file hash is already in the seen_hashes dictionary
         if file_hash in seen_hashes:
+            # If it is, log a duplicate detected message
             log(f"[!] Duplicate detected: {filepath} (same as {seen_hashes[file_hash]})")
+            # Get a unique destination path for the file
             dest_path = get_unique_dest(dest_path)
+            # Add the duplicate information to the duplicates list
             duplicates.append({
                 "duplicate": filepath,
                 "original": seen_hashes[file_hash],
                 "destination": dest_path
             })
         else:
+            # If the file hash is not in the seen_hashes dictionary, add it
             seen_hashes[file_hash] = filepath
 
+        # If the file is not already in the destination path, move it
         if os.path.abspath(filepath) != os.path.abspath(dest_path):
             shutil.move(filepath, dest_path)
             log(f"[✓] Moved: {filepath} -> {dest_path}")
         else:
+            # If the file is already in the destination path, log a message
             log(f"[=] Already in place: {filepath}")
+    # If an OSError occurs, log an error message
     except OSError as e:
         log(f"[!] Failed to create directory or move file '{filepath}': {e}")
+    # If any other exception occurs, log an error message
     except Exception as e:
         log(f"[!] Unexpected error processing '{filepath}': {e}")
 
 def process_directory(source_dir, target_dir, alias_file):
+    # Check if the source directory exists
     if not os.path.isdir(source_dir):
         log(f"[✗] Source directory does not exist: {source_dir}")
         return
 
+    # Load the aliases from the alias file
     artist_aliases, album_aliases = load_aliases(alias_file)
     log(f"[INFO] Loaded aliases from {alias_file}")
 
+    # Walk through the source directory
     for dirpath, _, filenames in os.walk(source_dir):
         for fname in filenames:
+            # Get the file extension
             ext = os.path.splitext(fname)[1].lower()
+            # Check if the file extension is supported
             if ext not in SUPPORTED_EXTS:
                 continue
+            # Get the full path of the file
             full_path = os.path.join(dirpath, fname)
+            # Organize the file
             organize_file(full_path, target_dir, artist_aliases, album_aliases)
 
+    # Check if there are any duplicates
     if duplicates:
+        # Log the duplicates
         with open(DUPLICATES_LOG, "w", encoding="utf-8") as f:
             json.dump(duplicates, f, indent=2, ensure_ascii=False)
         log(f"[✓] Duplicates logged in {DUPLICATES_LOG}")
