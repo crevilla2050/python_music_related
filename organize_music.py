@@ -49,42 +49,72 @@ DUPLICATES_LOG = "duplicate_files_log.json"
 seen_hashes = {}
 duplicates = []
 
+# Define a function called log that takes a parameter called message
 def log(message):
+    # Open the LOG_FILE in append mode and set the encoding to utf-8
     with open(LOG_FILE, "a", encoding="utf-8") as f:
+        # Write the message to the LOG_FILE followed by a newline character
         f.write(message + "\n")
+    # Print the message to the console
     print(message)
 
 def compute_sha256(filepath, block_size=65536):
+    # Create a SHA256 hasher object
     hasher = hashlib.sha256()
     try:
+        # Open the file in binary read mode
         with open(filepath, 'rb') as f:
+            # Read the file in chunks of block_size
             while chunk := f.read(block_size):
+                # Update the hasher with the chunk
                 hasher.update(chunk)
+        # Return the hexdigest of the hasher
         return hasher.hexdigest()
     except Exception as e:
+        # Log an error message if an exception is raised
         log(f"[!] Error hashing file {filepath}: {e}")
+        # Return None if an exception is raised
         return None
 
 def normalize_name(name, max_len=MAX_DIRNAME_LEN):
+    # Normalize the name using NFKD normalization
     name = unicodedata.normalize("NFKD", name)
+    # Remove any combining characters
     name = ''.join(c for c in name if not unicodedata.combining(c))
+    # Replace any characters that are not alphanumeric or a space with an underscore
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    # Replace any sequences of spaces and periods with an underscore
     name = re.sub(r'\s*\.+\s*', '_', name)
+    # Remove any leading or trailing spaces or periods
     name = name.strip(' .')
+    # Remove any characters that are not alphanumeric or a space, underscore, dash, or parentheses
     name = ''.join(c for c in name if c.isalnum() or c in " _-().[]").strip()
+    # Return the name truncated to the maximum length
     return name[:max_len]
 
-def normalize_filename(name, track=None):
-    name = normalize_name(name, max_len=MAX_FILENAME_LEN)
-    if track and track.isdigit():
-        return f"{track.zfill(2)} - {name}"
-    return name
+# Define a function called normalize_filename that takes in two parameters, name and track
+def normalize_filename(name, track_number=None):
+    # Split the filename into name and extension
+    name_only, ext = os.path.splitext(name)
+    # Remove any illegal characters from the name
+    name_only = re.sub(r'[\\/:*?"<>|]', '', name_only).strip()
 
+    # If a track number is provided and it is a digit, add it to the name
+    if track_number and track_number.isdigit():
+        name_only = f"{track_number.zfill(2)}. {name_only}"
+
+    # Return the normalized filename
+    return f"{name_only}{ext}"
+
+# Define a function called load_aliases that takes a json_file as an argument
 def load_aliases(json_file):
+    # Try to open the json_file and load the data
     try:
         with open(json_file, encoding="utf-8") as f:
             data = json.load(f)
+            # Return the artist_aliases and album_aliases from the data
             return data.get("artist_aliases", {}), data.get("album_aliases", {})
+    # If an exception is raised, log the error and return empty dictionaries
     except Exception as e:
         log(f"[!] Failed to load alias file: {e}")
         return {}, {}
