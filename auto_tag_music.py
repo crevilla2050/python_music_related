@@ -8,21 +8,11 @@ from mutagen.easyid3 import EasyID3
 
 SUPPORTED_EXTS = ['.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac']
 
-musicbrainzngs.set_useragent("MusicTagger", "1.0", "carlos.revilla.m@gmail.com")
+musicbrainzngs.set_useragent("MusicTagger", "1.0", "yourmail@example.com")
 
 # Known aliases mapping for artist normalization
 ARTIST_ALIASES = {
-    "vicente fernandez": "Vicente Fernández",
-    "vicente fernández": "Vicente Fernández",
-    "v. fernandez": "Vicente Fernández",
-    "v fernandez": "Vicente Fernández",
-    "cafe tacuba": "Café Tacvba",
-    "cafe tacvba": "Café Tacvba",
-    "café tacuba": "Café Tacvba",
-    "café tacvba": "Café Tacvba",
-    "cartel de santa": "Cartel De Santa",
-    "c. santa": "Cartel De Santa",
-    # Add more mappings as needed
+   # Add more mappings as needed
 }
 
 ALBUM_ALIASES = {
