@@ -2,12 +2,16 @@
 import os
 import sys
 import json
+import json
 import unicodedata
 import musicbrainzngs
 from mutagen import File as MutagenFile
 
 SUPPORTED_EXTS = ['.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac']
-
+# Set user agent for MusicBrainz API
+# Replace with your own user agent details
+# It's important to set a user agent to identify your application to the MusicBrainz API.
+# This helps MusicBrainz track usage and provide better service.
 musicbrainzngs.set_useragent("MusicTagger", "1.0", "yourmail@example.com")
 
 # Known aliases mapping for artist normalization
@@ -41,26 +45,56 @@ def load_aliases(path):
 
 ARTIST_ALIASES, ALBUM_ALIASES = load_aliases(ALIAS_FILE)
 
+musicbrainzngs.set_useragent("MusicTagger", "1.0", "yourmail@example.com")
+
+# Load alias maps from JSON
+# Define a function called load_aliases that takes a path as an argument
+def load_aliases(path):
+    # Check if the path exists
+    if os.path.exists(path):
+        # Open the file at the given path in read mode with utf-8 encoding
+        with open(path, "r", encoding="utf-8") as f:
+            # Load the data from the file
+            data = json.load(f)
+            # Return the artist_aliases and album_aliases from the data
+            return data.get("artist_aliases", {}), data.get("album_aliases", {})
+    # If the path does not exist, return empty dictionaries
+    return {}, {}
+
+ARTIST_ALIASES, ALBUM_ALIASES = load_aliases(ALIAS_FILE)
+
 def normalize_name(name):
+    # Convert the name to lowercase
     # Convert the name to lowercase
     name = name.lower()
     # Normalize the name to remove any accents or diacritics
+    # Normalize the name to remove any accents or diacritics
     name = unicodedata.normalize('NFKD', name)
+    # Remove any combining characters
     # Remove any combining characters
     name = ''.join(c for c in name if not unicodedata.combining(c))
     # Remove any non-alphanumeric characters and spaces
+    # Remove any non-alphanumeric characters and spaces
     name = ''.join(c for c in name if c.isalnum() or c.isspace()).strip()
+    # Return the normalized name
     # Return the normalized name
     return name
 
+# Define a function called normalize_artist_name that takes in a parameter called name
 # Define a function called normalize_artist_name that takes in a parameter called name
 def normalize_artist_name(name):
     # Call the normalize_name function and assign the result to the variable normalized
     normalized = normalize_name(name)
     # Return the value of the ARTIST_ALIASES dictionary with the key of normalized, or the title of name if the key is not found
     return ARTIST_ALIASES.get(normalized, name.title())
+    # Call the normalize_name function and assign the result to the variable normalized
+    normalized = normalize_name(name)
+    # Return the value of the ARTIST_ALIASES dictionary with the key of normalized, or the title of name if the key is not found
+    return ARTIST_ALIASES.get(normalized, name.title())
 
 def normalize_album_name(name):
+    normalized = normalize_name(name)
+    return ALBUM_ALIASES.get(normalized, name.title())
     normalized = normalize_name(name)
     return ALBUM_ALIASES.get(normalized, name.title())
 
