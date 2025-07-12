@@ -59,22 +59,34 @@ def calculate_hash(filepath, algo='sha256', block_size=65536):
         return None
 
 def scan_music_files(root_path):
+    # Initialize an empty list to store the files
     files = []
+    # Initialize two dictionaries to store the variants of artists and albums
     artist_variants = {}
     album_variants = {}
 
+    # Iterate through the root path and its subdirectories
     for dirpath, _, filenames in os.walk(root_path):
+        # Iterate through the filenames in the current directory
         for fname in filenames:
+            # Get the file extension
             ext = os.path.splitext(fname)[1].lower()
+            # If the file extension is not supported, skip it
             if ext not in SUPPORTED_EXTS:
                 continue
 
+            # Get the full path of the file
             full_path = os.path.join(dirpath, fname)
+            # Log the file being processed
             log(f"[*] Processing file: {full_path}")
+            # Get the tags of the file
             tags = get_tags(full_path)
+            # Calculate the hash of the file
             hash_val = calculate_hash(full_path)
+            # Normalize the file name
             norm_name = normalize_string(fname)
 
+            # Append the file information to the list
             files.append({
                 "path": full_path,
                 "name": fname,
@@ -83,76 +95,118 @@ def scan_music_files(root_path):
                 "hash": hash_val
             })
 
+            # If the file has an artist tag, add it to the artist variants dictionary
             if tags.get("artist"):
                 artist_raw = tags["artist"]
                 norm_artist = normalize_string(artist_raw)
                 artist_variants.setdefault(norm_artist, set()).add(artist_raw)
 
+            # If the file has an album tag, add it to the album variants dictionary
             if tags.get("album"):
                 album_raw = tags["album"]
                 norm_album = normalize_string(album_raw)
                 album_variants.setdefault(norm_album, set()).add(album_raw)
 
+    # Return the list of files, artist variants, and album variants
     return files, artist_variants, album_variants
 
+# Define a function to scan the folder structure of a given root path
 def scan_folder_structure(root_path):
+    # Create two dictionaries to store the variants of artists and albums
     artist_variants = {}
     album_variants = {}
 
+    # Iterate through the root path and its subdirectories
     for dirpath, dirnames, _ in os.walk(root_path):
+        # Get the relative path of the current directory
         rel_path = os.path.relpath(dirpath, root_path)
+        # Skip the root directory
         if rel_path == ".":
             continue
+        # Split the relative path into parts
         parts = rel_path.split(os.sep)
 
+        # If the relative path has only one part and it is not "collections"
         if len(parts) == 1 and parts[0].lower() != "collections":
+            # Get the raw artist name
             artist_raw = parts[0]
+            # Normalize the artist name
             norm_artist = normalize_string(artist_raw)
+            # Add the raw artist name to the set of variants for the normalized artist name
             artist_variants.setdefault(norm_artist, set()).add(artist_raw)
 
+        # If the relative path has two parts
         if len(parts) == 2:
+            # Get the raw album name
             album_raw = parts[1]
+            # Normalize the album name
             norm_album = normalize_string(album_raw)
+            # Add the raw album name to the set of variants for the normalized album name
             album_variants.setdefault(norm_album, set()).add(album_raw)
 
+            # If the first part of the relative path is not "collections"
             if parts[0].lower() != "collections":
+                # Get the raw artist name
                 artist_raw = parts[0]
+                # Normalize the artist name
                 norm_artist = normalize_string(artist_raw)
+                # Add the raw artist name to the set of variants for the normalized artist name
                 artist_variants.setdefault(norm_artist, set()).add(artist_raw)
 
+    # Return the dictionaries of artist and album variants
     return artist_variants, album_variants
 
 def build_aliases(variants_dict, threshold=SIMILARITY_THRESHOLD):
+    # Create a set to store the keys that have been seen
     seen = set()
+    # Create a dictionary to store the aliases
     aliases = {}
+    # Create a list of the keys in the variants_dict
     keys = list(variants_dict.keys())
 
+    # Iterate through the keys
     for i, key in enumerate(keys):
+        # If the key has already been seen, skip it
         if key in seen:
             continue
 
+        # Create a list to store the group of keys that are similar
         group = [key]
+        # Get the closest matches to the key
         matches = difflib.get_close_matches(key, keys, n=10, cutoff=threshold)
+        # Iterate through the matches
         for match in matches:
+            # If the match is not the key and has not been seen, add it to the group
             if match != key and match not in seen:
                 group.append(match)
 
+        # Create a set to store the combined variants
         combined = set()
+        # Iterate through the group
         for g in group:
+            # Add the variants to the combined set
             combined.update(variants_dict.get(g, []))
+            # Add the key to the seen set
             seen.add(g)
 
+        # Sort the combined set by length and get the last element
         canonical = sorted(combined, key=len)[-1]
+        # Iterate through the combined set
         for alias in combined:
+            # If the alias is not the canonical, add it to the aliases dictionary
             if alias != canonical:
                 aliases[alias] = canonical
 
+        # Log the group and canonical
         log(f"[~] Group: {group} → Canonical: {canonical}")
 
+    # Return the aliases dictionary
     return aliases
 
 def merge_variants(dict1, dict2):
+    # Create a copy of the first dictionary
     merged = dict1.copy()
+    # Iterate through the second dictionary
     for norm, variants in dict2.items():
         if norm in merged:
             merged[norm].update(variants)
