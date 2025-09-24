@@ -224,62 +224,6 @@ def merge_variants(dict1, dict2):
     # Return the combined dictionary of variants
     return merged
 
-
-def are_files_similar(file1, file2):
-    # If hashes are available and match, the files are identical
-    if file1['hash'] and file2['hash'] and file1['hash'] == file2['hash']:
-        return True
-
-    # Compare metadata tags (artist, title, album) for similarity
-    tags1, tags2 = file1["tags"], file2["tags"]
-    if tags1 and tags2:
-        matches = 0
-        total = 0
-        for key in ["artist", "title", "album"]:
-            val1 = normalize_string(tags1.get(key, ""))
-            val2 = normalize_string(tags2.get(key, ""))
-            if val1 and val2:
-                total += 1
-                # Consider fields matching exactly or with high similarity
-                if val1 == val2 or difflib.SequenceMatcher(None, val1, val2).ratio() > SIMILARITY_THRESHOLD:
-                    matches += 1
-        # If at least two out of three tags are similar, consider the files similar
-        if total > 0 and matches / total >= 0.66:
-            return True
-
-    # As a fallback, compare normalized filenames for similarity
-    similarity = difflib.SequenceMatcher(None, file1["norm_name"], file2["norm_name"]).ratio()
-    return similarity > SIMILARITY_THRESHOLD
-
-
-def find_duplicates(files):
-    # Create an empty set to store the indices of files that have been seen
-    seen = set()
-    # Create an empty list to store the groups of duplicate files
-    groups = []
-    # Iterate through the list of files
-    for i in range(len(files)):
-        # If the current file has already been seen, skip it
-        if i in seen:
-            continue
-        # Create a new group with the current file
-        group = [files[i]]
-        # Iterate through the remaining files
-        for j in range(i + 1, len(files)):
-            # If the current file has already been seen, skip it
-            if j in seen:
-                continue
-            # If the current file is similar to the previous file, add it to the group and mark it as seen
-            if are_files_similar(files[i], files[j]):
-                group.append(files[j])
-                seen.add(j)
-        # If the group contains more than one file, add it to the list of groups and mark the first file as seen
-        if len(group) > 1:
-            groups.append(group)
-            seen.add(i)
-    # Return the list of groups
-    return groups
-
 def main():
     # Set the global variable VERBOSE to False by default
     global VERBOSE
@@ -339,18 +283,6 @@ def main():
             }, f, indent=2, ensure_ascii=False)
         # Print that the aliases have been written to the JSON file
         print(f"[✓] Aliases written to artist_album_aliases.json")
-
-    # Check if the mode is "duplicates" or "all"
-    if mode in ("duplicates", "all"):
-        # Print that the duplicate files are being looked for
-        print("[*] Looking for duplicate files...")
-        # Find the duplicate files
-        dup_groups = find_duplicates(files)
-        # Write the duplicate files to a JSON file
-        with open("duplicates.json", "w", encoding="utf-8") as f:
-            json.dump(dup_groups, f, indent=2, ensure_ascii=False)
-        # Print that the duplicate files have been written to the JSON file
-        print(f"[✓] {len(dup_groups)} duplicate groups written to duplicates.json")
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,4 @@
 mutagen
 musicbrainzngs
 requests
+Pillow
