@@ -1,252 +1,297 @@
 #!/usr/bin/env python3
 
 # auto_add_music.py
+# Watch a folder, auto-organize music into structured library,
+# update DB if tags change, handle duplicates and missing tags.
 
 import os
 import sys
 import time
-import shutil
-import re
 import json
+import re
+import shutil
+import sqlite3
+import logging
+import unicodedata
+from hashlib import sha256
+from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from organize_music import organize_file
 from mutagen import File as MutagenFile
 from mutagen.easyid3 import EasyID3
 from musicbrainzngs import set_useragent, search_recordings
+from organize_music import organize_file  # external dependency; must exist
 
+# ---------------- CONFIG ----------------
 WATCH_FOLDER = os.path.expanduser("~/Music/AutoAdd")
-FAILED_FOLDER = os.path.expanduser("~/FailedMusic")
+FAILED_FOLDER = os.path.expanduser("~/Music/FailedMusic")
+DEFAULT_LIBRARY_ROOT = "/media/carlos/Asterix/MusicaCons"
+DB_PATH = os.path.expanduser("~/Music/auto_add_music.db")
 SUPPORTED_EXTS = ['.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac']
+DUP_FUZZY_THRESHOLD = 87  # For artist/title comparison
+# ---------------------------------------
 
-# MusicBrainz setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 set_useragent("MusicOrganizer", "1.0", "yourmail@example.com")
 
-# Command-line args
-if len(sys.argv) < 2:
-    print("Usage: python auto_add_music.py <library_root_path> [alias_json_file]")
-    sys.exit(1)
-
-LIBRARY_ROOT = os.path.abspath(sys.argv[1])
+LIBRARY_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) >= 2 else os.path.abspath(DEFAULT_LIBRARY_ROOT)
 alias_file = sys.argv[2] if len(sys.argv) >= 3 else None
 
 # Load aliases if provided
-artist_aliases = {}
-album_aliases = {}
+artist_aliases, album_aliases = {}, {}
 if alias_file:
     try:
         with open(alias_file, "r", encoding="utf-8") as f:
             aliases = json.load(f)
             artist_aliases = aliases.get("artist_aliases", {})
             album_aliases = aliases.get("album_aliases", {})
-        print(f"[INFO] Loaded alias file: {alias_file}")
+        logging.info("Loaded alias file: %s", alias_file)
     except Exception as e:
-        print(f"[!] Failed to load alias file '{alias_file}': {e}")
-else:
-    print("[INFO] No alias file provided. Proceeding without aliases.")
+        logging.warning("Failed to load alias file '%s': %s", alias_file, e)
 
-def has_reasonable_tags(filepath):
-    # Try to read the tags of the audio file
-    try:
-        audio = MutagenFile(filepath, easy=True)
-        # If the audio file is not found, return False
-        if not audio:
-            return False
-        # Get the artist and title of the audio file
-        artist = audio.get("artist", [None])[0]
-        title = audio.get("title", [None])[0]
-        # Return True if both artist and title are not None, otherwise return False
-        return bool(artist and title)
-    # If an exception is raised, print the error message and return False
-    except Exception as e:
-        print(f"[!] Error reading tags for {filepath}: {e}")
-        return False
+# Ensure folders exist
+os.makedirs(WATCH_FOLDER, exist_ok=True)
+os.makedirs(LIBRARY_ROOT, exist_ok=True)
+os.makedirs(FAILED_FOLDER, exist_ok=True)
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
-def enrich_tags(filepath, tags):
-    # Try to load the audio file using EasyID3
+# Initialize DB (one-off)
+_conn = sqlite3.connect(DB_PATH)
+_cur = _conn.cursor()
+_cur.execute("""
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    artist TEXT,
+    album TEXT,
+    title TEXT,
+    track TEXT,
+    hash TEXT
+)
+""")
+_conn.commit()
+_cur.close()
+_conn.close()
+
+# ---------------- HELPERS ----------------
+def normalize_string(s):
+    if not s:
+        return ""
+    s = str(s)
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def file_hash(filepath):
     try:
-        audio = EasyID3(filepath)
-    # If an exception is raised, try to load the audio file using MutagenFile
+        h = sha256()
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()
     except Exception:
-        audio = MutagenFile(filepath, easy=True)
-        # If MutagenFile returns None, return
-        if audio is None:
-            return
-        # Add tags to the audio file
-        audio.add_tags()
-        # Reload the audio file using EasyID3
-        audio = EasyID3(filepath)
-
-    # Loop through the tags dictionary
-    for key, value in tags.items():
-        # If the key is not in the audio file or the value is None, add the key-value pair to the audio file
-        if key not in audio or not audio.get(key):
-            audio[key] = value
-    # Save the audio file
-    audio.save()
-
-def musicbrainz_fallback(filepath):
-    # Get the filename from the filepath
-    filename = os.path.splitext(os.path.basename(filepath))[0]
-    # Check if the filename contains a '-' to split artist and title
-    if '-' not in filename:
-        print(f"[!] Filename '{filename}' does not contain '-' to split artist/title")
-        return None
-    # Split the filename into artist and title
-    artist_guess, title_guess = map(str.strip, filename.split('-', 1))
-    try:
-        # Search for the recording on MusicBrainz
-        result = search_recordings(artist=artist_guess, recording=title_guess, limit=1)
-        # Get the first recording from the result
-        rec = result['recording-list'][0]
-        # Get the artist and title from the recording
-        artist = rec['artist-credit'][0]['artist']['name']
-        title = rec['title']
-        # Get the album from the recording
-        album = rec['release-list'][0]['title'] if 'release-list' in rec else 'Unknown'
-        # Return the artist, title, album and tracknumber
-        return {'artist': artist, 'title': title, 'album': album, 'tracknumber': '00'}
-    except Exception as e:
-        # Print an error message if the search fails
-        print(f"[!] MusicBrainz search failed for '{filename}': {e}")
         return None
 
 def normalize_filename(name, track_number=None):
-    # Split the filename into name and extension
     name_only, ext = os.path.splitext(name)
-    # Remove any illegal characters from the name
     name_only = re.sub(r'[\\/:*?"<>|]', '', name_only).strip()
-
-    # If a track number is provided and it is a digit, add it to the name
-    if track_number and track_number.isdigit():
-        name_only = f"{track_number.zfill(2)}. {name_only}"
-
-    # Return the normalized filename
+    if track_number:
+        tn = str(track_number).split('/')[0].strip()
+        if tn.isdigit():
+            name_only = f"{tn.zfill(2)}. {name_only}"
     return f"{name_only}{ext}"
 
-
-#Define a function called is_duplicate that takes in a parameter new_path
-def is_duplicate(new_path):
-    #Check if the new_path exists in the current directory
-    return os.path.exists(new_path)
-
-def process_file(filepath):
-    # Print a debug message indicating the file being processed
-    print(f"[DEBUG] Processing file: {filepath}")
-    # Check if the file exists
-    if not os.path.isfile(filepath):
-        # If the file does not exist, print a message and return
-        print(f"[!] Skipping non-file: {filepath}")
-        return
-
-    # Get the file extension
-    ext = os.path.splitext(filepath)[1].lower()
-    # Check if the file extension is supported
-    if ext not in SUPPORTED_EXTS:
-        # If the file extension is not supported, print a message and return
-        print(f"[!] Unsupported file extension '{ext}', skipping: {filepath}")
-        return
-
-    # Initialize the tags variable
-    tags = None
-    # Check if the file has reasonable tags
-    if not has_reasonable_tags(filepath):
-        # If the file does not have reasonable tags, print a message and attempt a MusicBrainz fallback
-        print(f"[!] Incomplete tags, attempting MusicBrainz fallback for: {filepath}")
-        # Attempt a MusicBrainz fallback
-        tags = musicbrainz_fallback(filepath)
-        # Check if the MusicBrainz fallback found any tags
-        if not tags:
-            # If no tags were found, print a message and move the file to the failed directory
-            print(f"[✗] No tags found via MusicBrainz for: {filepath}")
-            move_to_failed(filepath)
-            return
-        else:
-            # If tags were found, print a message and enrich the tags
-            print(f"[✓] Tags found via MusicBrainz fallback: {tags}")
-            enrich_tags(filepath, tags)
-    else:
-        # If the file already has reasonable tags, print a message
-        print(f"[✓] File already has reasonable tags: {filepath}")
-
-    # Organize the file
-    new_path = organize_file(filepath, LIBRARY_ROOT, artist_aliases, album_aliases)
-    # Check if the file was organized successfully
-    if new_path:
-        # If the file was organized successfully, get the filename and track number
-        filename = os.path.basename(new_path)
-        track_number = ""
-        try:
-            # Try to get the track number from the audio file
-            audio = MutagenFile(filepath, easy=True)
-            track_number = audio.get("tracknumber", [""])[0]
-        except Exception:
-            # If an exception is raised, pass
-            pass
-
-        # Normalize the filename
-        normalized = normalize_filename(filename, track_number)
-        # Create the new path
-        new_path = os.path.join(os.path.dirname(new_path), normalized)
-
-        # Check if the new path is a duplicate
-        if is_duplicate(new_path):
-            # If the new path is a duplicate, print a message and move the file to the failed directory
-            print(f"[!] Duplicate file detected, skipping: {new_path}")
-            move_to_failed(filepath)
-            return
-
-        try:
-            # Try to move the file to the new path
-            shutil.move(filepath, new_path)
-            # If the file was moved successfully, print a message
-            print(f"[✓] Moved to: {new_path}")
-        except Exception as e:
-            # If an exception is raised, print a message and move the file to the failed directory
-            print(f"[!] Failed to move file to {new_path}: {e}")
-            move_to_failed(filepath)
-    else:
-        # If the file was not organized successfully, print a message and move the file to the failed directory
-        print(f"[!] Failed to organize: {filepath}")
-        move_to_failed(filepath)
-
 def move_to_failed(filepath):
-    os.makedirs(FAILED_FOLDER, exist_ok=True)
     try:
-        failed_path = os.path.join(FAILED_FOLDER, os.path.basename(filepath))
+        base = os.path.basename(filepath)
+        failed_path = os.path.join(FAILED_FOLDER, base)
+        if os.path.exists(failed_path):
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            name, ext = os.path.splitext(base)
+            failed_path = os.path.join(FAILED_FOLDER, f"{name}-{ts}{ext}")
         shutil.move(filepath, failed_path)
-        print(f"[→] Moved to Failed folder: {failed_path}")
+        logging.info("Moved to Failed folder: %s", failed_path)
     except Exception as e:
-        print(f"[!] Failed to move to Failed folder: {e}")
+        logging.warning("Failed to move to Failed folder: %s", e)
 
+def musicbrainz_fallback(filepath):
+    # Best-effort placeholder: real implementation should parse filename or audio fingerprint
+    return None
+
+# ---------------- PROCESSING ----------------
+def is_duplicate(artist, title, filepath):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT path, artist, title FROM files")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.warning("DB error during duplicate check: %s", e)
+        return False
+
+    n_artist = normalize_string(artist)
+    n_title = normalize_string(title)
+    for row_path, db_artist, db_title in rows:
+        if row_path == filepath:
+            continue
+        if normalize_string(db_artist) == n_artist and normalize_string(db_title) == n_title:
+            return True
+    return False
+
+def check_and_update_file(filepath):
+    if not os.path.isfile(filepath):
+        return
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext not in SUPPORTED_EXTS:
+        return
+
+    tags = {}
+    try:
+        audio = MutagenFile(filepath, easy=True)
+        tags = {
+            'artist': audio.get('artist', [''])[0] if audio else '',
+            'title': audio.get('title', [''])[0] if audio else '',
+            'album': audio.get('album', [''])[0] if audio else '',
+            'track': audio.get('tracknumber', [''])[0] if audio else ''
+        }
+    except Exception:
+        tags = {}
+
+    if not tags.get('artist') or not tags.get('title'):
+        fb = musicbrainz_fallback(filepath)
+        if fb:
+            tags.update(fb)
+            try:
+                # try to write tags back
+                audio = MutagenFile(filepath, easy=True)
+                if audio:
+                    for k, v in fb.items():
+                        audio[k] = v
+                    audio.save()
+            except Exception:
+                pass
+        else:
+            move_to_failed(filepath)
+            return
+
+    artist = artist_aliases.get(tags.get('artist', ''), tags.get('artist', ''))
+    album = album_aliases.get(tags.get('album', ''), tags.get('album', ''))
+    title = tags.get('title', '')
+    track = tags.get('track', '')
+
+    try:
+        new_path = organize_file(filepath, LIBRARY_ROOT, artist_aliases, album_aliases)
+    except Exception as e:
+        logging.warning("organize_file failed for %s: %s", filepath, e)
+        move_to_failed(filepath)
+        return
+
+    if not new_path:
+        logging.warning("organize_file returned no destination for %s", filepath)
+        move_to_failed(filepath)
+        return
+
+    dest_dir = os.path.dirname(new_path)
+    os.makedirs(dest_dir, exist_ok=True)
+    normalized_name = normalize_filename(os.path.basename(new_path), track)
+    final_path = os.path.join(dest_dir, normalized_name)
+
+    if (not os.path.exists(filepath)) and os.path.exists(final_path):
+        src_present = False
+    else:
+        src_present = True
+
+    if is_duplicate(artist, title, final_path):
+        logging.info("Duplicate detected, moving original to failed: %s", filepath)
+        if src_present:
+            move_to_failed(filepath)
+        return
+
+    if src_present:
+        try:
+            if os.path.exists(final_path):
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                name, ext = os.path.splitext(normalized_name)
+                final_path = os.path.join(dest_dir, f"{name}-{ts}{ext}")
+            shutil.move(filepath, final_path)
+            logging.info("Moved to: %s", final_path)
+        except Exception as e:
+            logging.warning("Failed to move %s -> %s : %s", filepath, final_path, e)
+            move_to_failed(filepath)
+            return
+    else:
+        logging.info("File already moved by organizer: %s", final_path)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        file_hash_val = file_hash(final_path)
+        cur.execute("""
+            INSERT OR REPLACE INTO files(path, artist, album, title, track, hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (final_path, artist, album, title, track, file_hash_val))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.warning("Failed to update DB for %s: %s", final_path, e)
+
+# ---------------- WATCHDOG ----------------
 class MusicHandler(FileSystemEventHandler):
     def on_created(self, event):
-        print(f"[DEBUG] Event detected: {event.src_path}, is_directory={event.is_directory}")
         if event.is_directory:
             return
         time.sleep(1)
-        process_file(event.src_path)
+        try:
+            check_and_update_file(event.src_path)
+        except Exception as e:
+            logging.exception("Error handling created event for %s: %s", event.src_path, e)
 
 def process_existing_files():
-    print(f"[INFO] Processing existing files in {WATCH_FOLDER} at startup...")
+    logging.info("Processing existing files in %s...", WATCH_FOLDER)
     for root, _, files in os.walk(WATCH_FOLDER):
-        for file in files:
-            filepath = os.path.join(root, file)
-            process_file(filepath)
+        for f in files:
+            filepath = os.path.join(root, f)
+            try:
+                prev_size = -1
+                stable = 0
+                for _ in range(5):
+                    if not os.path.exists(filepath):
+                        break
+                    size = os.path.getsize(filepath)
+                    if size == prev_size:
+                        stable += 1
+                    else:
+                        stable = 0
+                    prev_size = size
+                    if stable >= 2:
+                        break
+                    time.sleep(0.5)
+            except Exception:
+                pass
+            try:
+                check_and_update_file(filepath)
+            except Exception as e:
+                logging.exception("Error processing existing file %s: %s", filepath, e)
 
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    os.makedirs(WATCH_FOLDER, exist_ok=True)
-
     process_existing_files()
     observer = Observer()
+    observer.daemon = True
     observer.schedule(MusicHandler(), path=WATCH_FOLDER, recursive=True)
     observer.start()
-    print(f"[INFO] Watching folder for new files: {WATCH_FOLDER}")
-
+    logging.info("Watching %s -> %s", WATCH_FOLDER, LIBRARY_ROOT)
     try:
         while True:
             time.sleep(5)
     except KeyboardInterrupt:
-        print("\n[INFO] Stopping observer...")
+        logging.info("Stopping observer...")
         observer.stop()
     observer.join()
+    conn.close()
+    print("Usage: python scan_sources_sqlite.py <source_directory>")
+    sys.exit(1)

@@ -17,7 +17,7 @@ SUPPORTED_EXTS = ['.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac']
 DB_FILE = "music_library.db"
 MAX_DIRNAME_LEN = 100
 MAX_FILENAME_LEN = 100
-DUP_SUFFIX = "_dup"  # your choice for duplicates
+DUP_SUFFIX = "_dup"
 FUZZY_THRESHOLD = 0.85  # for artist/title fuzzy match
 FP_BLOCK = 65536
 # --------------------------------------------
@@ -69,31 +69,42 @@ def normalize_filename(name, track=None):
     return f"{name_only}{ext}"
 
 def compute_sha1_fingerprint(fp_file):
-    """Return SHA-1 of chromaprint fingerprint string"""
     return hashlib.sha1(fp_file.encode('utf-8')).hexdigest()
 
-def compute_fingerprint(path):
-    """Run fpcalc and return SHA-1 of fingerprint"""
-    try:
-        result = subprocess.run(['fpcalc', '-raw', '-length', '120', path],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                universal_newlines=True,
-                                check=True)
-        for line in result.stdout.splitlines():
-            if line.startswith("FINGERPRINT="):
-                fp_raw = line.split("=", 1)[1]
-                return compute_sha1_fingerprint(fp_raw)
-    except Exception as e:
-        log(f"[!] Fingerprint failed: {path} -> {e}")
+def compute_fingerprint(path, max_retries=2, length=120):
+    """
+    Run fpcalc and return SHA-1 of fingerprint.
+    Retries on failure, reduces length on repeated crashes.
+    Returns None if all attempts fail.
+    """
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            cmd_length = max(length - attempt*30, 30)  # reduce length on retry
+            result = subprocess.run(
+                ['fpcalc', '-raw', '-length', str(cmd_length), path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=True
+            )
+            for line in result.stdout.splitlines():
+                if line.startswith("FINGERPRINT="):
+                    fp_raw = line.split("=", 1)[1]
+                    return compute_sha1_fingerprint(fp_raw)
+            log(f"[!] fpcalc returned no fingerprint: {path}")
+            return None
+        except subprocess.CalledProcessError as e:
+            log(f"[!] fpcalc failed (attempt {attempt+1}/{max_retries+1}): {path} -> {e}")
+        except Exception as e:
+            log(f"[!] Unexpected error running fpcalc (attempt {attempt+1}/{max_retries+1}): {path} -> {e}")
+        attempt += 1
+    log(f"[!] All fpcalc attempts failed: {path}")
     return None
+# --------------------------------------------
 
 def extract_tags(filepath):
-    """
-    Extracts tags from the given file using Mutagen.
-    If tags are missing, attempts to parse artist and title from the filename.
-    Returns a dictionary with artist, album, title, and track.
-    """
+    """Extract tags from audio file, fallback to filename parsing"""
     try:
         audio = MutagenFile(filepath, easy=True)
         artist = album = title = track = ""
@@ -104,10 +115,9 @@ def extract_tags(filepath):
             title  = audio.get("title", [""])[0].strip()
             track  = audio.get("tracknumber", [""])[0].split("/")[0].strip()
 
-        # If either artist or title is missing, attempt to parse from filename
+        # Fallback: parse filename
         if not artist or not title:
             fname = os.path.splitext(os.path.basename(filepath))[0]
-            # Example heuristics
             if " - " in fname:
                 parts = fname.split(" - ", 1)
                 if not artist:
@@ -121,7 +131,6 @@ def extract_tags(filepath):
                 if not title:
                     title = "_".join(parts[1:]).strip()
 
-        # Fall back to defaults if still empty
         if not artist:
             artist = "Unknown Artist"
         if not album:
@@ -131,22 +140,11 @@ def extract_tags(filepath):
         if not track:
             track = ""
 
-        return {
-            "artist": artist,
-            "album": album,
-            "title": title,
-            "track": track
-        }
+        return {"artist": artist, "album": album, "title": title, "track": track}
     except Exception as e:
         log(f"[!] Error extracting tags from '{filepath}': {e}")
-        # Fallback: infer from filename
         fname = os.path.splitext(os.path.basename(filepath))[0]
-        return {
-            "artist": "Unknown Artist",
-            "album": "Unknown Album",
-            "title": fname,
-            "track": ""
-        }
+        return {"artist": "Unknown Artist", "album": "Unknown Album", "title": fname, "track": ""}
 
 def fuzzy_match_tags(t1, t2):
     artist1, title1 = t1
@@ -180,51 +178,47 @@ def organize_file(conn, path, target_root):
 
     # Compute fingerprint
     hash_fp = compute_fingerprint(path)
-    if not hash_fp:
-        log(f"[!] Skipping file (no fingerprint): {path}")
-        return
 
-    mtime = int(os.path.getmtime(path))
-    c = conn.cursor()
-
-    # Check DB for existing file by fingerprint
-    c.execute("SELECT id, path, status FROM files WHERE hash_fp=?", (hash_fp,))
-    row = c.fetchone()
-
-    if row:
-        # Exact duplicate
-        orig_path = row[1]
-        new_dest = get_unique_dest(dest_path)
-        os.rename(path, new_dest)
-        log(f"[DUPLICATE] {path} -> {new_dest}")
-        status = "duplicate"
-        path_to_store = new_dest
-    else:
+    # Move file first (regardless of fingerprint)
+    if os.path.abspath(path) != os.path.abspath(dest_path):
+        os.rename(path, dest_path)
+        log(f"[✓] Moved {path} -> {dest_path}")
         path_to_store = dest_path
-        status = "active"
-        # Fuzzy duplicate check
+    else:
+        path_to_store = path
+
+    c = conn.cursor()
+    status = "active"
+
+    # Check for duplicates by fingerprint
+    if hash_fp:
+        c.execute("SELECT id, path, status FROM files WHERE hash_fp=?", (hash_fp,))
+        row = c.fetchone()
+        if row:
+            orig_path = row[1]
+            new_dest = get_unique_dest(dest_path)
+            os.rename(path_to_store, new_dest)
+            log(f"[DUPLICATE] {path_to_store} -> {new_dest}")
+            path_to_store = new_dest
+            status = "duplicate"
+    else:
+        # Fuzzy duplicate fallback
         c.execute("SELECT artist, title, path FROM files WHERE status='active'")
         for r in c.fetchall():
             if fuzzy_match_tags((tags['artist'], tags['title']), (r[0], r[1])):
                 status = "suspected_duplicate"
-                log(f"[SUSPECTED DUPLICATE] {path} ~ {r[2]}")
+                log(f"[SUSPECTED DUPLICATE] {path_to_store} ~ {r[2]}")
                 break
-        # Move if not already in place
-        if os.path.abspath(path) != os.path.abspath(dest_path):
-            os.rename(path, dest_path)
-            log(f"[✓] Moved {path} -> {dest_path}")
-            path_to_store = dest_path
 
     # Insert or update DB
-    c.execute("""
-        SELECT id, hash_fp, file_mtime, status FROM files WHERE path=?
-    """, (path_to_store,))
+    c.execute("SELECT id, hash_fp, file_mtime, status FROM files WHERE path=?", (path_to_store,))
     existing = c.fetchone()
     now = int(time.time())
+    mtime = int(os.path.getmtime(path_to_store))
+
     if existing:
-        # Update if modified
         db_hash_fp, db_mtime, db_status = existing[1], existing[2], existing[3]
-        if db_mtime != mtime or db_hash_fp != hash_fp:
+        if db_mtime != mtime or db_hash_fp != hash_fp or db_status != status:
             c.execute("""
                 UPDATE files SET artist=?, album=?, title=?, track=?, hash_fp=?, file_mtime=?, status=? WHERE path=?
             """, (tags['artist'], tags['album'], tags['title'], tags['track'], hash_fp, mtime, status, path_to_store))
