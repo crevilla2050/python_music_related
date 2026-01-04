@@ -9,7 +9,11 @@ import hashlib
 import time
 import re
 import unicodedata
+import chromaprint
+import shutil
+import tempfile
 from mutagen import File as MutagenFile
+from mutagen.easyid3 import EasyID3
 from difflib import SequenceMatcher
 
 # ------------------ CONFIG ------------------
@@ -19,7 +23,12 @@ MAX_DIRNAME_LEN = 100
 MAX_FILENAME_LEN = 100
 DUP_SUFFIX = "_dup"
 FUZZY_THRESHOLD = 0.85  # for artist/title fuzzy match
-FP_BLOCK = 65536
+# Fingerprint settings
+FP_MAX_SECONDS = 120
+FP_MIN_SECONDS = 30
+FP_RETRIES = 3
+# Re-encode behavior
+REENCODE_ON_FAILURE = True  # toggle re-encoding attempts
 # --------------------------------------------
 
 # ------------------ LOGGING -----------------
@@ -70,37 +79,241 @@ def normalize_filename(name, track=None):
 
 def compute_sha1_fingerprint(fp_file):
     return hashlib.sha1(fp_file.encode('utf-8')).hexdigest()
+# --------------------------------------------
 
-def compute_fingerprint(path, max_retries=2, length=120):
+# ---------- Re-encoding helpers -------------
+def probe_format(path):
     """
-    Run fpcalc and return SHA-1 of fingerprint.
-    Retries on failure, reduces length on repeated crashes.
-    Returns None if all attempts fail.
+    Return lowercased extension without dot (mp3, flac, wav, m4a, ogg, aac).
+    If unknown, return None.
+    """
+    ext = os.path.splitext(path)[1].lower().lstrip('.')
+    if ext in ['mp3', 'flac', 'wav', 'm4a', 'ogg', 'aac']:
+        return ext
+    return None
+
+def read_tags_generic(path):
+    """Return a dict with artist, album, title, track to reapply after re-encode."""
+    try:
+        audio = MutagenFile(path, easy=True)
+        if not audio:
+            return {}
+        return {
+            'artist': audio.get('artist', [''])[0],
+            'album': audio.get('album', [''])[0],
+            'title': audio.get('title', [''])[0],
+            'tracknumber': audio.get('tracknumber', [''])[0]
+        }
+    except Exception:
+        return {}
+
+def write_tags_generic(path, tags):
+    """Attempt to write simple tags to the new file using Mutagen."""
+    try:
+        audio = MutagenFile(path, easy=True)
+        if audio is None:
+            return
+        for k, v in tags.items():
+            if not v:
+                continue
+            # Map tracknumber key to tag name used by Mutagen
+            if k == 'tracknumber':
+                audio['tracknumber'] = v
+            else:
+                audio[k] = v
+        audio.save()
+    except Exception as e:
+        log(f"[!] Failed to write tags to {path}: {e}")
+
+def reencode_file_same_format(src_path):
+    """
+    Re-encode src_path into a temporary file using same codec/format with high-quality settings.
+    Returns temp_path or None on failure.
+    """
+    fmt = probe_format(src_path)
+    if not fmt:
+        log(f"[!] Unknown format for re-encode: {src_path}")
+        return None
+
+    # prepare temp output path
+    fd, tmp_path = tempfile.mkstemp(suffix='.' + fmt)
+    os.close(fd)  # we'll let ffmpeg write it
+    tags = read_tags_generic(src_path)
+
+    # choose ffmpeg args per format (high-quality / lossless where possible)
+    # We keep channels/sample rate untouched except when needed to ensure compatibility.
+    if fmt == 'mp3':
+        # Use libmp3lame, high quality VBR (~320kbps)
+        args = ['-c:a', 'libmp3lame', '-qscale:a', '0']
+    elif fmt == 'flac':
+        # FLAC lossless, compression level 5 (balanced)
+        args = ['-c:a', 'flac', '-compression_level', '5']
+    elif fmt == 'wav':
+        # PCM 16-bit, 44.1k
+        args = ['-c:a', 'pcm_s16le']
+    elif fmt in ('m4a', 'aac'):
+        # AAC via native encoder - high bitrate
+        args = ['-c:a', 'aac', '-b:a', '256k']
+    elif fmt == 'ogg':
+        # Vorbis with quality 6
+        args = ['-c:a', 'libvorbis', '-qscale:a', '6']
+    elif fmt == 'aac':
+        args = ['-c:a', 'aac', '-b:a', '256k']
+    else:
+        # fallback to copying streams (may fail); try libopus? but we stick to default
+        args = ['-c:a', 'copy']
+
+    ffmpeg_cmd = ['ffmpeg', '-v', 'quiet', '-y', '-i', src_path] + args + [tmp_path]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True)
+        # write tags to tmp file
+        write_tags_generic(tmp_path, tags)
+        return tmp_path
+    except Exception as e:
+        log(f"[!] Re-encode failed for {src_path}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return None
+# --------------------------------------------
+
+def compute_fingerprint(path, max_seconds=FP_MAX_SECONDS, retries=FP_RETRIES):
+    """
+    Compute Chromaprint fingerprint using FFmpeg + Python bindings.
+    Retries with decreasing length if crashes occur.
+    On repeated failures, optionally re-encode the file (keeping same format) and try again.
+    Returns SHA-1 hex string of the raw fingerprint, or None on failure.
     """
     attempt = 0
-    while attempt <= max_retries:
+    while attempt < retries:
+        seconds = max(FP_MIN_SECONDS, max_seconds - attempt * ((max_seconds - FP_MIN_SECONDS) // max(1, retries-1)))
         try:
-            cmd_length = max(length - attempt*30, 30)  # reduce length on retry
-            result = subprocess.run(
-                ['fpcalc', '-raw', '-length', str(cmd_length), path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                check=True
-            )
-            for line in result.stdout.splitlines():
-                if line.startswith("FINGERPRINT="):
-                    fp_raw = line.split("=", 1)[1]
-                    return compute_sha1_fingerprint(fp_raw)
-            log(f"[!] fpcalc returned no fingerprint: {path}")
-            return None
-        except subprocess.CalledProcessError as e:
-            log(f"[!] fpcalc failed (attempt {attempt+1}/{max_retries+1}): {path} -> {e}")
+            ffmpeg_cmd = [
+                "ffmpeg", "-v", "quiet", "-i", path,
+                "-f", "s16le",
+                "-acodec", "pcm_s16le",
+                "-ac", "2",
+                "-ar", "44100",
+                "-"
+            ]
+
+            p = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                bytes_needed = int(seconds * 44100 * 2 * 2)
+                pcm = p.stdout.read(bytes_needed)
+            finally:
+                try:
+                    p.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                try:
+                    p.wait(timeout=1)
+                except Exception:
+                    pass
+
+            if not pcm:
+                log(f"[!] FFmpeg produced no PCM data (attempt {attempt+1}/{retries}) for: {path}")
+                attempt += 1
+                continue
+
+            fp = chromaprint.Fingerprinter()
+            fp.feed(pcm)
+            raw_fp = fp.finish()
+
+            if not raw_fp:
+                log(f"[!] Chromaprint returned empty fingerprint (attempt {attempt+1}/{retries}): {path}")
+                attempt += 1
+                continue
+
+            return compute_sha1_fingerprint(raw_fp)
+
         except Exception as e:
-            log(f"[!] Unexpected error running fpcalc (attempt {attempt+1}/{max_retries+1}): {path} -> {e}")
-        attempt += 1
-    log(f"[!] All fpcalc attempts failed: {path}")
+            log(f"[!] Fingerprint attempt {attempt+1}/{retries} failed for {path}: {e}")
+            attempt += 1
+
+    log(f"[!] All fingerprint attempts failed for: {path}")
+
+    # Try re-encoding if enabled and not already tried via temp file
+    if REENCODE_ON_FAILURE:
+        log(f"[i] Attempting re-encode to recover fingerprint for: {path}")
+        tmp = reencode_file_same_format(path)
+        if tmp:
+            try:
+                # try fingerprinting the reencoded file (single try with max_seconds)
+                fp_tmp = compute_fingerprint_on_temp(tmp, max_seconds)
+                if fp_tmp:
+                    # replace original with reencoded file (safer: move reencoded over original)
+                    try:
+                        # preserve mtime
+                        try:
+                            orig_mtime = os.path.getmtime(path)
+                        except Exception:
+                            orig_mtime = None
+                        shutil.move(tmp, path)
+                        if orig_mtime:
+                            os.utime(path, (orig_mtime, orig_mtime))
+                        log(f"[✓] Re-encoded and replaced original: {path}")
+                    except Exception as e:
+                        log(f"[!] Failed to replace original with re-encoded file: {e}")
+                        # if move failed leave tmp and continue with fingerprint from tmp
+                    return fp_tmp
+                else:
+                    log(f"[!] Fingerprint still failed after re-encode for: {path}")
+            finally:
+                # cleanup temp if still exists
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
     return None
+
+def compute_fingerprint_on_temp(tmp_path, max_seconds):
+    """Helper to fingerprint a temporary file with single attempt (no re-encode recursion)."""
+    try:
+        ffmpeg_cmd = [
+            "ffmpeg", "-v", "quiet", "-i", tmp_path,
+            "-f", "s16le",
+            "-acodec", "pcm_s16le",
+            "-ac", "2",
+            "-ar", "44100",
+            "-"
+        ]
+        p = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            bytes_needed = int(max_seconds * 44100 * 2 * 2)
+            pcm = p.stdout.read(bytes_needed)
+        finally:
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+            try:
+                p.kill()
+            except Exception:
+                pass
+            try:
+                p.wait(timeout=1)
+            except Exception:
+                pass
+
+        if not pcm:
+            return None
+
+        fp = chromaprint.Fingerprinter()
+        fp.feed(pcm)
+        raw_fp = fp.finish()
+        if not raw_fp:
+            return None
+        return compute_sha1_fingerprint(raw_fp)
+    except Exception:
+        return None
 # --------------------------------------------
 
 def extract_tags(filepath):
@@ -118,6 +331,8 @@ def extract_tags(filepath):
         # Fallback: parse filename
         if not artist or not title:
             fname = os.path.splitext(os.path.basename(filepath))[0]
+            # Strip leading track numbers like "01 - " or "1. "
+            fname = re.sub(r'^\d+\s*[-\.]\s*', '', fname)
             if " - " in fname:
                 parts = fname.split(" - ", 1)
                 if not artist:
@@ -176,13 +391,17 @@ def organize_file(conn, path, target_root):
     filename = normalize_filename(f"{tags['artist']} - {tags['title']}{os.path.splitext(path)[1]}", tags['track'])
     dest_path = os.path.join(dest_dir, filename)
 
-    # Compute fingerprint
+    # Compute fingerprint (use Python-native chromaprint)
     hash_fp = compute_fingerprint(path)
 
     # Move file first (regardless of fingerprint)
     if os.path.abspath(path) != os.path.abspath(dest_path):
-        os.rename(path, dest_path)
-        log(f"[✓] Moved {path} -> {dest_path}")
+        try:
+            os.rename(path, dest_path)
+            log(f"[✓] Moved {path} -> {dest_path}")
+        except Exception as e:
+            log(f"[!] Failed to move {path} -> {dest_path}: {e}")
+            return
         path_to_store = dest_path
     else:
         path_to_store = path
@@ -190,19 +409,22 @@ def organize_file(conn, path, target_root):
     c = conn.cursor()
     status = "active"
 
-    # Check for duplicates by fingerprint
+    # Check for duplicates by fingerprint (if we have one)
     if hash_fp:
-        c.execute("SELECT id, path, status FROM files WHERE hash_fp=?", (hash_fp,))
+        c.execute("SELECT id, path, status, hash_fp FROM files WHERE hash_fp=?", (hash_fp,))
         row = c.fetchone()
         if row:
             orig_path = row[1]
             new_dest = get_unique_dest(dest_path)
-            os.rename(path_to_store, new_dest)
-            log(f"[DUPLICATE] {path_to_store} -> {new_dest}")
-            path_to_store = new_dest
-            status = "duplicate"
+            try:
+                os.rename(path_to_store, new_dest)
+                log(f"[DUPLICATE] {path_to_store} -> {new_dest}")
+                path_to_store = new_dest
+                status = "duplicate"
+            except Exception as e:
+                log(f"[!] Failed to rename duplicate {path_to_store} -> {new_dest}: {e}")
     else:
-        # Fuzzy duplicate fallback
+        # Fingerprint failed: fuzzy duplicate fallback
         c.execute("SELECT artist, title, path FROM files WHERE status='active'")
         for r in c.fetchall():
             if fuzzy_match_tags((tags['artist'], tags['title']), (r[0], r[1])):
@@ -214,15 +436,33 @@ def organize_file(conn, path, target_root):
     c.execute("SELECT id, hash_fp, file_mtime, status FROM files WHERE path=?", (path_to_store,))
     existing = c.fetchone()
     now = int(time.time())
-    mtime = int(os.path.getmtime(path_to_store))
+    try:
+        mtime = int(os.path.getmtime(path_to_store))
+    except Exception:
+        mtime = now
 
     if existing:
-        db_hash_fp, db_mtime, db_status = existing[1], existing[2], existing[3]
-        if db_mtime != mtime or db_hash_fp != hash_fp or db_status != status:
+        db_id = existing[0]
+        db_hash_fp = existing[1]
+        db_mtime = existing[2]
+        db_status = existing[3]
+
+        # Option A: replace old fingerprints (force recompute)
+        # Detect "old" fingerprints that don't look like 40-char SHA1, or simply differ.
+        need_update_fp = (db_hash_fp is None) or (len(db_hash_fp) != 40) or (db_hash_fp != hash_fp and hash_fp is not None)
+
+        if need_update_fp:
             c.execute("""
-                UPDATE files SET artist=?, album=?, title=?, track=?, hash_fp=?, file_mtime=?, status=? WHERE path=?
-            """, (tags['artist'], tags['album'], tags['title'], tags['track'], hash_fp, mtime, status, path_to_store))
-            log(f"[DB UPDATED] {path_to_store}")
+                UPDATE files SET artist=?, album=?, title=?, track=?, hash_fp=?, file_mtime=?, status=? WHERE id=?
+            """, (tags['artist'], tags['album'], tags['title'], tags['track'], hash_fp, mtime, status, db_id))
+            log(f"[DB UPDATED - NEW FP] {path_to_store}")
+        else:
+            # Update metadata/mtime/status only if changed
+            if db_mtime != mtime or db_status != status:
+                c.execute("""
+                    UPDATE files SET artist=?, album=?, title=?, track=?, file_mtime=?, status=? WHERE id=?
+                """, (tags['artist'], tags['album'], tags['title'], tags['track'], mtime, status, db_id))
+                log(f"[DB UPDATED] {path_to_store}")
     else:
         c.execute("""
             INSERT INTO files (path, artist, album, title, track, hash_fp, file_mtime, first_seen, status)
@@ -231,9 +471,11 @@ def organize_file(conn, path, target_root):
         log(f"[DB INSERT] {path_to_store}")
 
     conn.commit()
+# --------------------------------------------
 
 def process_directory(source_dir, target_dir):
     conn = init_db(DB_FILE)
+    # scan files
     for root, _, files in os.walk(source_dir):
         for name in files:
             ext = os.path.splitext(name)[1].lower()
