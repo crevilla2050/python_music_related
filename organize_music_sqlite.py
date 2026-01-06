@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # organize_music_sqlite.py
+# DEPRECATED — superseded by consolidate_music.py + execute_actions.py
 
 import os
 import sys
