@@ -24,13 +24,23 @@ from mutagen import File as MutagenFile
 # Constants
 # -------------------------------
 
+# Keywords commonly used in album-art filenames. Used to detect
+# high-confidence 'sibling' cover images placed alongside audio files.
+# The list is intentionally small and conservative to reduce false
+# positives when scanning arbitrary directories.
 COVER_KEYWORDS = [
     "cover",
     "folder",
     "front",
     "albumart",
+    "album_art",
+    "albumartSmall",
+    "artwork",    
 ]
 
+# Supported image file extensions for sibling image detection. These
+# are common formats used for album art; the set is restrictive so
+# the code ignores unrelated files (e.g., text or archive files).
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -39,6 +49,14 @@ SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 # -------------------------------
 
 def normalize(s: Optional[str]) -> str:
+    """
+    Normalize text for comparison and display.
+
+    Why: Tag data can come from many sources with different unicode
+    normalization forms and combining characters (accents). Normalizing
+    makes downstream comparisons and storage deterministic without
+    changing the semantic content of the tags.
+    """
     if not s:
         return ""
     s = unicodedata.normalize("NFKD", s)
@@ -47,6 +65,14 @@ def normalize(s: Optional[str]) -> str:
 
 
 def clean_token(s: str) -> str:
+    """
+    Lightweight token cleaner used to produce readable artist/album
+    segments from filenames or path components.
+
+    Why: Filesystem names often use underscores, repeated whitespace,
+    or other separators. This helper standardizes those tokens so
+    inferred tags look sensible to users and downstream logic.
+    """
     s = normalize(s)
     s = re.sub(r'[_]+', ' ', s)
     s = re.sub(r'\s+', ' ', s)
@@ -54,12 +80,27 @@ def clean_token(s: str) -> str:
 
 
 def filename_to_title(filename: str) -> str:
+    """
+    Derive a reasonable track title from a filename.
+
+    Why: Many filenames begin with track numbers or use separators
+    that are not part of the human-readable title. This function
+    strips common numeric prefixes and cleans the remainder so the
+    inferred `title` is useful when embedded tags are missing.
+    """
     name = os.path.splitext(os.path.basename(filename))[0]
     name = re.sub(r'^\d+\s*[-._]\s*', '', name)
     return clean_token(name)
 
 
 def sha256_bytes(data: bytes) -> str:
+    """
+    Return a SHA-256 hex digest for a bytes object.
+
+    Why: We use a compact content hash to identify identical images
+    or to create stable IDs for images suggested as album art. Hashes
+    are stored instead of raw bytes to keep diagnostic storage small.
+    """
     return hashlib.sha256(data).hexdigest()
 
 
@@ -68,6 +109,16 @@ def sha256_bytes(data: bytes) -> str:
 # -------------------------------
 
 def extract_existing_tags(path: str) -> Dict[str, Optional[str]]:
+    """
+    Read embedded tags from an audio file using Mutagen.
+
+    Why: Embedded metadata is the highest-confidence source for tags.
+    This function returns a small set of commonly used fields plus a
+    boolean `is_compilation` when the file's raw tags indicate a
+    compilation. The code keeps a defensive try/except because files
+    can be malformed or unsupported; in that case we return an empty
+    dict and allow lower-confidence inference to proceed.
+    """
     try:
         audio_easy = MutagenFile(path, easy=True)
         audio_raw = MutagenFile(path, easy=False)

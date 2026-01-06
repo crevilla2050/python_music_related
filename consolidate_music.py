@@ -37,6 +37,9 @@ except Exception:
     chromaprint = None
 
 # ================= CONFIG =================
+# Configuration for supported file types and optional fingerprinting.
+# - `SUPPORTED_EXTS` lists audio file suffixes the script will process.
+# - `ENABLE_CHROMAPRINT` and `FP_SECONDS` control fingerprint generation.
 
 SUPPORTED_EXTS = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".aac", ".opus"}
 
@@ -57,6 +60,8 @@ def log(msg):
     logging.info(msg)
 
 def maybe_progress(it, desc=None, enable=False):
+    # Wrap an iterator with tqdm progress bar when requested and available.
+    # This keeps the function safe to call even if `tqdm` isn't installed.
     if enable and tqdm:
         return tqdm(it, desc=desc)
     return it
@@ -64,6 +69,9 @@ def maybe_progress(it, desc=None, enable=False):
 # ================= DATABASE =================
 
 def create_db():
+    # Create a timestamped SQLite DB to stage analysis results.
+    # The DB filename is written into a local `.env` file so other
+    # helper scripts can discover it via environment variables.
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     db_name = f"music_consolidation_{ts}.db"
 
@@ -156,9 +164,12 @@ def create_db():
 # ================= UTILITIES =================
 
 def is_audio_file(p: Path):
+    # True only for regular files with a supported audio extension.
     return p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
 
 def sha256_file(path: Path):
+    # Compute a streaming SHA-256 hash of the file contents. Files are
+    # read in 64KiB chunks to avoid loading large files entirely into RAM.
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -169,9 +180,12 @@ def normalize_str(s):
     if not s:
         return ""
     s = unicodedata.normalize("NFKD", s)
+    # Remove combining characters (accents) and trim surrounding whitespace.
     return "".join(c for c in s if not unicodedata.combining(c)).strip()
 
 def sanitize_for_fs(s):
+    # Make a string safe for filesystem use by removing or replacing
+    # characters that are problematic in filenames on most platforms.
     if not s:
         return "Unknown"
     s = normalize_str(s)
@@ -186,9 +200,13 @@ def normalize_track(track_raw):
     track_raw = str(track_raw).strip()
     if "/" in track_raw:
         track_raw = track_raw.split("/", 1)[0]
+    # Normalize numeric track numbers to two-digit strings (e.g. 3 -> '03').
     return f"{int(track_raw):02d}" if track_raw.isdigit() else None
 
 def recommended_path_for(root, meta, ext):
+    # Build a recommended canonical path for this track inside the
+    # consolidation library. This is only a suggestion stored in the DB
+    # and not enforced by this script — it helps later move/rename steps.
     artist = sanitize_for_fs(meta.get("album_artist") or meta.get("artist") or "Unknown Artist")
     album = sanitize_for_fs(meta.get("album") or "Unknown Album")
     title = sanitize_for_fs(meta.get("title") or meta.get("orig_name"))
@@ -203,6 +221,9 @@ def extract_tags(path: Path):
         audio = MutagenFile(path, easy=True)
         raw = MutagenFile(path, easy=False)
 
+        # Read common metadata fields using mutagen. `easy=True` gives
+        # normalized, easy-to-use tag names while `easy=False` lets us
+        # inspect raw tags for compilation flags.
         album_artist = audio.get("albumartist", [None])[0] if audio else None
         is_comp = 0
 
@@ -248,6 +269,10 @@ def analyze_files(src, lib, progress=False, with_fingerprint=False):
     for p in maybe_progress(audio_list, "Analyzing", progress):
         meta = extract_tags(p)
         sha = sha256_file(p)
+        # Optionally compute and store a compact fingerprint to help
+        # detect perceptual duplicates (requires `ffmpeg` and the
+        # `chromaprint` Python bindings). If fingerprinting is disabled
+        # or unavailable, `fp` will be None.
         fp = compute_fingerprint(p) if with_fingerprint else None
         rec = recommended_path_for(lib, meta, p.suffix)
         now = datetime.now(timezone.utc).isoformat()
@@ -273,6 +298,9 @@ def analyze_files(src, lib, progress=False, with_fingerprint=False):
 
 # ================= FINGERPRINT =========
 def compute_fingerprint(path: Path):
+    # Compute an audio fingerprint using Chromaprint. This requires:
+    # - `ffmpeg` available on PATH to decode audio to raw PCM
+    # - the `chromaprint` Python bindings installed in the environment
     if not ENABLE_CHROMAPRINT or chromaprint is None:
         return None
 
@@ -303,7 +331,9 @@ def compute_fingerprint(path: Path):
         fp.feed(pcm)
         fingerprint, _ = fp.finish()
 
-        # Store *hashed* fingerprint (compact + indexable)
+        # Store a hashed version of the fingerprint. Storing the hash
+        # (instead of the raw chromaprint string) keeps the DB compact
+        # and is sufficient for equality/index checks.
         return hashlib.sha1(fingerprint.encode()).hexdigest()
 
     except Exception as e:
@@ -321,6 +351,9 @@ def main():
     parser.add_argument("--with-fingerprint", action="store_true",
         help="Compute Chromaprint fingerprint during ingest")
     args = parser.parse_args()
+    # Call the main analysis routine. `--with-fingerprint` controls
+    # whether chromaprint is used; it is passed explicitly to the
+    # `analyze_files` function so the behavior is clear and testable.
     analyze_files(args.src, args.lib, args.progress, args.with_fingerprint)
 
 

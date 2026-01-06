@@ -2,13 +2,28 @@
 """
 execute_actions.py
 
-Authoritative execution phase for music consolidation.
+Authoritative execution phase for the consolidation pipeline.
 
-Rules:
-- NEVER infer paths
-- NEVER recompute metadata
-- ONLY trust SQLite DB
-- ALL deletes are SOFT deletes (to_trash/)
+Purpose and guarantees:
+- This module performs the final filesystem operations indicated by
+    the staging SQLite DB (`files` table). It is intentionally strict
+    about its inputs: it NEVER infers file locations or recomputes
+    metadata, and it only trusts the decisions already recorded in the
+    database. This separation keeps analysis and execution responsibilities
+    distinct and auditable.
+
+Operational rules (design constraints):
+- NEVER infer paths: use `recommended_path` written to the DB rather
+    than guessing where a file should live.
+- NEVER recompute metadata: do not read or change embedded tags during
+    execution — all decisions come from the DB.
+- ONLY trust the SQLite DB: the DB is the single source of truth for
+    what actions to perform.
+- ALL deletes are SOFT deletes: files are moved to a `trash_root`
+    (default `to_trash`) so deletions are reversible and auditable.
+
+The script is conservative and idempotent where possible: it commits
+per-row so progress is durable and errors affect only the current row.
 """
 
 import sqlite3
@@ -32,17 +47,45 @@ VALID_ACTIONS = {"move", "archive", "delete", "skip"}
 # -------------------- helpers --------------------
 
 def utcnow():
+    """
+    Return a UTC ISO-8601 timestamp string.
+
+    Why: Execution events and DB updates are timestamped to provide a
+    reliable audit trail. Using UTC prevents timezone-related sorting
+    or comparison issues when multiple machines or operators inspect
+    the records.
+    """
     return datetime.now(timezone.utc).isoformat()
 
 def log(msg):
+    """
+    Simple timestamped logger used for runtime output.
+
+    Why: This lightweight logging makes it easy to correlate script
+    output with DB `last_update` timestamps during post-run review.
+    """
     print(f"[{utcnow()}] {msg}")
 
 def connect_db(db_path):
+    """
+    Create a sqlite3 connection that returns row-like objects.
+
+    Why: Using `sqlite3.Row` lets code address columns by name which
+    improves readability and reduces index-based errors when updating
+    rows during execution.
+    """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 def ensure_parent(path: Path):
+    """
+    Ensure the parent directory for `path` exists.
+
+    Why: File move/archiving operations create destination directories
+    as needed. This helper centralizes that behavior and avoids race
+    conditions when multiple moves target the same directory.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -55,6 +98,7 @@ def execute(
     dry_run=False,
     limit=None
 ):
+    # Resolve and normalize filesystem roots.
     trash_root = Path(trash_root).resolve()
     if archive_root:
         archive_root = Path(archive_root).resolve()
@@ -62,6 +106,10 @@ def execute(
     conn = connect_db(db_path)
     c = conn.cursor()
 
+    # Load actionable rows determined by earlier pipeline stages. We
+    # strictly filter by `action` values that the execution layer
+    # knows how to perform and avoid rows already processed or in an
+    # error state.
     query = """
         SELECT id, original_path, recommended_path, action, status, notes
         FROM files
@@ -75,6 +123,7 @@ def execute(
     rows = c.execute(query).fetchall()
     log(f"Loaded {len(rows)} actionable rows (dry_run={dry_run})")
 
+    # Track counts for human-friendly summary at the end of the run.
     summary = {
         "moved": 0,
         "archived": 0,
@@ -90,10 +139,14 @@ def execute(
         dst = None
 
         try:
+            # Validate source exists; if not, mark as error for review.
             if not src or not src.exists():
                 raise RuntimeError(f"missing_source: {row['original_path']}")
 
             # ---------------- MOVE ----------------
+            # Move files into their recommended canonical paths. The
+            # `recommended_path` is considered authoritative because it
+            # was produced by prior analysis stages.
             if action == "move":
                 if not row["recommended_path"]:
                     raise RuntimeError("move_without_recommended_path")
@@ -116,6 +169,7 @@ def execute(
                 summary["moved"] += 1
 
             # ---------------- ARCHIVE ----------------
+            # Move files into an archive root supplied by the operator.
             elif action == "archive":
                 if not archive_root:
                     raise RuntimeError("archive_root_not_provided")
@@ -138,6 +192,8 @@ def execute(
                 summary["archived"] += 1
 
             # ---------------- SOFT DELETE ----------------
+            # Soft-delete moves files to a `trash_root` directory rather
+            # than permanently removing them, enabling recovery.
             elif action == "delete":
                 dst = trash_root / src.name
                 ensure_parent(dst)
@@ -158,6 +214,7 @@ def execute(
 
             # ---------------- SKIP ----------------
             elif action == "skip":
+                # Mark as skipped; no filesystem operation is performed.
                 log(f"[SKIP] {src}")
                 c.execute("""
                     UPDATE files
@@ -167,9 +224,14 @@ def execute(
                 """, (utcnow(), fid))
                 summary["skipped"] += 1
 
+            # Commit progress for each row so the state is durable even
+            # if the script is interrupted later.
             conn.commit()
 
         except Exception as e:
+            # On any error, mark the row `error` and include a note so
+            # operators can triage what went wrong. We commit immediately
+            # after updating the error state to avoid retry storms.
             log(f"[ERROR] ID {fid}: {e}")
             c.execute("""
                 UPDATE files
