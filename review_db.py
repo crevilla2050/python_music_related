@@ -20,7 +20,15 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = "music_consolidation.db"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_PATH = os.getenv("MUSIC_DB")
+if not DB_PATH:
+    raise SystemExit("[ERROR] MUSIC_DB not set in .env")
+
 DEFAULT_ACTION = "move"
 
 ACTIONS = {
@@ -30,6 +38,7 @@ ACTIONS = {
     "a": "archive",
     "n": "note",
     "p": "path",
+    "c": "canonical",   # NEW
     "q": "quit",
 }
 
@@ -66,8 +75,13 @@ def fetch_candidates(conn, resume=False, limit=None, only_duplicates=False):
             f.status,
             f.action,
             f.notes,
-            f.recommended_path
+            f.recommended_path,
+            d.reason AS duplicate_reason,
+            d.confidence AS duplicate_confidence,
+            d.file1_id AS canonical_id
         FROM files f
+        LEFT JOIN duplicates d
+            ON f.id = d.file2_id
     """
 
     where = []
@@ -119,7 +133,12 @@ def review_loop(rows):
         print(f"Proposed → : {pretty(row['recommended_path'])}")
 
         while True:
-            print("\n[m]ove [s]kip [d]elete [a]rchive [p]ath [n]ote [q]uit")
+            opts = "[m]ove [s]kip [d]elete [a]rchive [p]ath [n]ote"
+            if row.get("canonical_id"):
+                opts += " [c]anonical"
+            opts += " [q]uit"
+            print("\n" + opts)
+
             choice = input("> ").strip().lower()
 
             if choice not in ACTIONS:
@@ -178,7 +197,36 @@ def review_loop(rows):
                 )
                 conn.commit()
                 print("Proposed path updated.")
+                
+            #- ---- Use canonical file's path ----
+            if action == "canonical":
+                cid = row.get("canonical_id")
+                if not cid:
+                    print("No canonical file linked.")
+                    continue
+
+                cur.execute(
+                    "SELECT * FROM files WHERE id = ?",
+                    (cid,)
+                )
+                canon = cur.fetchone()
+                if not canon:
+                    print("Canonical file not found.")
+                    continue
+
+                print_header(canon["id"])
+                print(f"Path       : {canon['original_path']}")
+                print(f"Artist     : {pretty(canon['artist'])}")
+                print(f"Album      : {pretty(canon['album'])}")
+                print(f"Title      : {pretty(canon['title'])}")
+                print(f"Duration   : {pretty(canon['duration'])}")
+                print(f"Bitrate    : {pretty(canon['bitrate'])}")
+                print(f"Status     : {pretty(canon['status'])}")
+                print(f"Action     : {pretty(canon['action'])}")
+                print(f"Notes      : {pretty(canon['notes'])}")
+                print(f"Proposed → : {pretty(canon['recommended_path'])}")
                 continue
+
 
             # ---- Final decision (move / skip / delete / archive) ----
             cur.execute(

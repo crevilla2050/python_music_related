@@ -4,10 +4,10 @@ consolidate_music.py
 
 Music consolidation pipeline with:
 - SHA-256 identity
-- Canonical resolution
 - OPTIONAL Chromaprint fingerprinting
-- Fuzzy filename + metadata similarity
-- Safe staged decisions via SQLite
+- Canonical resolution
+- Metadata ingestion
+- SQLite staging DB (timestamped)
 """
 
 import os
@@ -24,6 +24,7 @@ from pathlib import Path
 
 from mutagen import File as MutagenFile
 from rapidfuzz import fuzz
+from dotenv import load_dotenv
 
 try:
     from tqdm import tqdm
@@ -37,31 +38,14 @@ except Exception:
 
 # ================= CONFIG =================
 
-DB_PATH = "music_consolidation.db"
-PLAN_JSON = "move_plan.json"
-
 SUPPORTED_EXTS = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".aac", ".opus"}
 
 ENABLE_CHROMAPRINT = True
 FP_SECONDS = 90
 
-DUP_FILENAME_THRESHOLD = 85
-METADATA_SIMILARITY_THRESHOLD = 70
-
-METADATA_ARTIST_WEIGHT = 0.45
-METADATA_TITLE_WEIGHT = 0.45
-METADATA_DURATION_BONUS = 10
-METADATA_BITRATE_BONUS = 5
-
-DURATION_TOLERANCE_SECONDS = 3.0
-BITRATE_REL_TOLERANCE = 0.20
+load_dotenv()
 
 # ========================================
-
-
-def log(msg):
-    logging.info(msg)
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,54 +53,110 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 
+def log(msg):
+    logging.info(msg)
 
 def maybe_progress(it, desc=None, enable=False):
     if enable and tqdm:
         return tqdm(it, desc=desc)
     return it
 
-
 # ================= DATABASE =================
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
+def create_db():
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    db_name = f"music_consolidation_{ts}.db"
+
+    with open(".env", "w") as f:
+        f.write(f"MUSIC_DB={db_name}\n")
+
+    log(f"Database created: {db_name}")
+    log(f".env updated: MUSIC_DB={db_name}")
+
+    conn = sqlite3.connect(db_name)
     c = conn.cursor()
+
     c.executescript("""
     PRAGMA foreign_keys = ON;
 
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         original_path TEXT UNIQUE,
+
         sha256 TEXT,
         size_bytes INTEGER,
+
         artist TEXT,
+        album_artist TEXT,
         album TEXT,
         title TEXT,
         track TEXT,
+
         duration REAL,
         bitrate INTEGER,
+
         fingerprint TEXT,
+
+        is_compilation INTEGER DEFAULT 0,
+
         status TEXT DEFAULT 'pending',
         action TEXT NOT NULL DEFAULT 'move',
+
         recommended_path TEXT,
+
         first_seen TEXT,
         last_update TEXT,
         notes TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS duplicates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file1_id INTEGER NOT NULL,
+        file2_id INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        confidence REAL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(file1_id) REFERENCES files(id),
+        FOREIGN KEY(file2_id) REFERENCES files(id)
+    );
+    
+    CREATE TABLE IF NOT EXISTS album_art (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        album_artist TEXT,
+        album TEXT,
+        is_compilation INTEGER DEFAULT 0,
+
+        image_hash TEXT,
+        source TEXT,
+        confidence REAL,
+
+        mime TEXT,
+        width INTEGER,
+        height INTEGER,
+
+        status TEXT DEFAULT 'suggested',
+
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_album_art_album ON album_art(album_artist, album, is_compilation);
+    CREATE INDEX IF NOT EXISTS idx_album_art_status ON album_art(status);
     CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
     CREATE INDEX IF NOT EXISTS idx_files_fp ON files(fingerprint);
-    CREATE INDEX IF NOT EXISTS idx_files_status_action ON files(status, action);
+    CREATE INDEX IF NOT EXISTS idx_files_album_artist ON files(album_artist);
+    CREATE INDEX IF NOT EXISTS idx_files_compilation ON files(is_compilation);
+                    
+    
     """)
-    conn.commit()
-    return conn
 
+    conn.commit()
+    return conn, db_name
 
 # ================= UTILITIES =================
 
 def is_audio_file(p: Path):
     return p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
-
 
 def sha256_file(path: Path):
     h = hashlib.sha256()
@@ -125,13 +165,11 @@ def sha256_file(path: Path):
             h.update(chunk)
     return h.hexdigest()
 
-
 def normalize_str(s):
     if not s:
         return ""
     s = unicodedata.normalize("NFKD", s)
     return "".join(c for c in s if not unicodedata.combining(c)).strip()
-
 
 def sanitize_for_fs(s):
     if not s:
@@ -140,95 +178,104 @@ def sanitize_for_fs(s):
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
     return s.strip(" .")[:120]
 
-
 def normalize_track(track_raw):
-    """
-    Normalize track numbers to 2-digit strings.
-    Examples:
-      "3"     -> "03"
-      "03"    -> "03"
-      "3/12"  -> "03"
-      None    -> None
-      "abc"   -> None
-    """
     if not track_raw:
         return None
-
     if isinstance(track_raw, list):
         track_raw = track_raw[0]
-
     track_raw = str(track_raw).strip()
-
     if "/" in track_raw:
         track_raw = track_raw.split("/", 1)[0]
-
-    if not track_raw.isdigit():
-        return None
-
-    num = int(track_raw)
-    if num <= 0 or num > 99:
-        return None
-
-    return f"{num:02d}"
-
+    return f"{int(track_raw):02d}" if track_raw.isdigit() else None
 
 def recommended_path_for(root, meta, ext):
-    artist = sanitize_for_fs(meta.get("artist") or "Unknown Artist")
+    artist = sanitize_for_fs(meta.get("album_artist") or meta.get("artist") or "Unknown Artist")
     album = sanitize_for_fs(meta.get("album") or "Unknown Album")
-
-    raw_title = meta.get("title")
-    if raw_title:
-        title = sanitize_for_fs(raw_title)
-    else:
-        title = sanitize_for_fs(Path(meta.get("orig_name", "Track")).stem)
-
+    title = sanitize_for_fs(meta.get("title") or meta.get("orig_name"))
     track = meta.get("track")
-
-    if track:
-        fname = f"{track} - {title}{ext}"
-    else:
-        fname = f"{title}{ext}"
-
+    fname = f"{track} - {title}{ext}" if track else f"{title}{ext}"
     return str(Path(root) / artist / album / fname)
-
 
 # ================= METADATA =================
 
 def extract_tags(path: Path):
     try:
         audio = MutagenFile(path, easy=True)
-        if not audio:
-            raise Exception("Unsupported")
+        raw = MutagenFile(path, easy=False)
 
-        raw_track = audio.get("tracknumber", [None])[0]
-        norm_track = normalize_track(raw_track)
+        album_artist = audio.get("albumartist", [None])[0] if audio else None
+        is_comp = 0
+
+        if raw and hasattr(raw, "tags"):
+            for k in raw.tags.keys():
+                if str(k).lower() in ("tcmp", "compilation", "cpil"):
+                    is_comp = 1
+                    break
 
         return {
             "artist": audio.get("artist", [None])[0],
+            "album_artist": album_artist,
             "album": audio.get("album", [None])[0],
             "title": audio.get("title", [None])[0],
-            "track": norm_track,
+            "track": normalize_track(audio.get("tracknumber", [None])[0]),
             "duration": getattr(audio.info, "length", None),
             "bitrate": getattr(audio.info, "bitrate", None),
-            "orig_name": path.name
+            "is_compilation": is_comp,
+            "orig_name": path.stem
         }
     except Exception:
         return {
             "artist": None,
+            "album_artist": None,
             "album": None,
             "title": None,
             "track": None,
             "duration": None,
             "bitrate": None,
-            "orig_name": path.name
+            "is_compilation": 0,
+            "orig_name": path.stem
         }
 
+# ================= INGEST =================
 
-# ================= FINGERPRINT =================
+def analyze_files(src, lib, progress=False, with_fingerprint=False):
+    conn, db_name = create_db()
+    c = conn.cursor()
 
+    audio_list = [p for p in Path(src).rglob("*") if is_audio_file(p)]
+    log(f"Found {len(audio_list)} audio files")
+
+    for p in maybe_progress(audio_list, "Analyzing", progress):
+        meta = extract_tags(p)
+        sha = sha256_file(p)
+        fp = compute_fingerprint(p) if with_fingerprint else None
+        rec = recommended_path_for(lib, meta, p.suffix)
+        now = datetime.now(timezone.utc).isoformat()
+
+        c.execute("""
+        INSERT INTO files (
+            original_path, sha256, size_bytes, artist, album_artist,
+            album, title, track, duration, bitrate, fingerprint,
+            is_compilation, recommended_path, first_seen, last_update
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(p), sha, p.stat().st_size,
+            meta["artist"], meta["album_artist"],
+            meta["album"], meta["title"], meta["track"],
+            meta["duration"], meta["bitrate"], fp,
+            meta["is_compilation"], rec, now, now
+        ))
+
+    conn.commit()
+    conn.close()
+    log("Analysis complete")
+
+# ================= FINGERPRINT =========
 def compute_fingerprint(path: Path):
     if not ENABLE_CHROMAPRINT or chromaprint is None:
         return None
+
     try:
         cmd = [
             "ffmpeg",
@@ -240,6 +287,7 @@ def compute_fingerprint(path: Path):
             "-ar", "44100",
             "-"
         ]
+
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -248,200 +296,32 @@ def compute_fingerprint(path: Path):
         )
 
         pcm = proc.stdout
+        if not pcm:
+            return None
+
         fp = chromaprint.Fingerprinter(44100, 1)
         fp.feed(pcm)
         fingerprint, _ = fp.finish()
 
+        # Store *hashed* fingerprint (compact + indexable)
         return hashlib.sha1(fingerprint.encode()).hexdigest()
 
-    except Exception:
-        logging.debug("Fingerprinting failed for %s", path, exc_info=True)
+    except Exception as e:
+        logging.debug(f"Fingerprint failed for {path}: {e}")
         return None
-
-
-# ================= DUPLICATE SCORING =================
-
-def filename_fuzzy_score(p1: Path, p2: Path):
-    def norm(p):
-        s = re.sub(r'^\d+\s*[-._]\s*', '', p.stem)
-        s = re.sub(r'[\[\]\(\)\-_.]', ' ', s)
-        s = unicodedata.normalize("NFKD", s).casefold()
-        return re.sub(r'\s+', ' ', s).strip()
-    return fuzz.ratio(norm(p1), norm(p2))
-
-
-def metadata_similarity_score(m1, m2):
-    a = fuzz.ratio(normalize_str(m1.get("artist")), normalize_str(m2.get("artist")))
-    t = fuzz.ratio(normalize_str(m1.get("title")), normalize_str(m2.get("title")))
-    score = a * METADATA_ARTIST_WEIGHT + t * METADATA_TITLE_WEIGHT
-
-    if m1.get("duration") and m2.get("duration"):
-        if abs(m1["duration"] - m2["duration"]) <= DURATION_TOLERANCE_SECONDS:
-            score += METADATA_DURATION_BONUS
-
-    if m1.get("bitrate") and m2.get("bitrate"):
-        if abs(m1["bitrate"] - m2["bitrate"]) / max(1, m1["bitrate"]) <= BITRATE_REL_TOLERANCE:
-            score += METADATA_BITRATE_BONUS
-
-    return min(100.0, score)
-
-
-# ================= UPSERT =================
-
-def upsert_file(conn, path, sha, size, meta, rec, fp):
-    now = datetime.now(timezone.utc).isoformat()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO files (
-            original_path, sha256, size_bytes,
-            artist, album, title, track,
-            duration, bitrate, fingerprint,
-            recommended_path, first_seen, last_update
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(original_path) DO UPDATE SET
-            sha256=excluded.sha256,
-            size_bytes=excluded.size_bytes,
-            artist=excluded.artist,
-            album=excluded.album,
-            title=excluded.title,
-            track=excluded.track,
-            duration=excluded.duration,
-            bitrate=excluded.bitrate,
-            fingerprint=excluded.fingerprint,
-            recommended_path=excluded.recommended_path,
-            last_update=excluded.last_update
-    """, (
-        str(path), sha, size,
-        meta["artist"], meta["album"], meta["title"], meta["track"],
-        meta["duration"], meta["bitrate"], fp,
-        rec, now, now
-    ))
-
-
-# ================= CANONICAL RESOLUTION =================
-
-def resolve_fingerprint_duplicates(conn):
-    c = conn.cursor()
-    c.execute("""
-        SELECT fingerprint FROM files
-        WHERE fingerprint IS NOT NULL
-        GROUP BY fingerprint
-        HAVING COUNT(*) > 1
-    """)
-    fps = [r[0] for r in c.fetchall()]
-
-    log(f"Resolving {len(fps)} fingerprint clusters")
-
-    for fp in fps:
-        c.execute("""
-            SELECT id, artist, album, title, bitrate
-            FROM files WHERE fingerprint=?
-        """, (fp,))
-        rows = c.fetchall()
-
-        rows.sort(
-            key=lambda r: (
-                bool(r[1]) + bool(r[2]) + bool(r[3]),
-                r[4] or 0
-            ),
-            reverse=True
-        )
-
-        winner = rows[0][0]
-        c.execute("UPDATE files SET action='move', status='unique' WHERE id=?", (winner,))
-
-        for r in rows[1:]:
-            c.execute("""
-                UPDATE files
-                SET action='archive',
-                    status='duplicate',
-                    notes='fingerprint_match'
-                WHERE id=?
-            """, (r[0],))
-
-    conn.commit()
-
-
-# ================= ANALYSIS =================
-
-def analyze_files(src, lib, progress=False):
-    conn = init_db()
-
-    audio_list = [p for p in Path(src).rglob("**/*") if is_audio_file(p)]
-    log(f"Found {len(audio_list)} audio files")
-
-    try:
-        with conn:
-            for p in maybe_progress(audio_list, "Analyzing", progress):
-                try:
-                    sha = sha256_file(p)
-                    meta = extract_tags(p)
-                    fp = compute_fingerprint(p)
-                    rec = recommended_path_for(lib, meta, p.suffix)
-                    upsert_file(conn, p, sha, p.stat().st_size, meta, rec, fp)
-                except Exception:
-                    logging.debug("Failed to process %s", p, exc_info=True)
-
-        resolve_fingerprint_duplicates(conn)
-        build_plan_json(conn)
-
-    finally:
-        conn.close()
-
-    log("Analysis complete")
-
-
-# ================= JSON =================
-
-def build_plan_json(conn):
-    c = conn.cursor()
-    c.execute("SELECT * FROM files")
-    cols = [d[0] for d in c.description]
-    files = [dict(zip(cols, r)) for r in c.fetchall()]
-
-    with open(PLAN_JSON, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "files": files
-            },
-            f,
-            indent=2
-        )
-
-    log(f"Wrote {PLAN_JSON}")
-
 
 # ================= CLI =================
 
 def main():
-    parser = __import__("argparse").ArgumentParser(description="Consolidate music library")
-    parser.add_argument("--src")
-    parser.add_argument("--lib")
-    parser.add_argument("--analyze-files", nargs=2, metavar=("SRC", "LIB"))
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", required=True)
+    parser.add_argument("--lib", required=True)
     parser.add_argument("--progress", action="store_true")
-    parser.add_argument("--db")
-    parser.add_argument("--plan")
-
+    parser.add_argument("--with-fingerprint", action="store_true",
+        help="Compute Chromaprint fingerprint during ingest")
     args = parser.parse_args()
-
-    if args.analyze_files:
-        src, lib = args.analyze_files
-    else:
-        src, lib = args.src, args.lib
-
-    if not src or not lib:
-        parser.print_help()
-        return
-
-    global DB_PATH, PLAN_JSON
-    if args.db:
-        DB_PATH = args.db
-    if args.plan:
-        PLAN_JSON = args.plan
-
-    analyze_files(src, lib, args.progress)
+    analyze_files(args.src, args.lib, args.progress, args.with_fingerprint)
 
 
 if __name__ == "__main__":

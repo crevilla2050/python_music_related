@@ -20,7 +20,8 @@ function App() {
 
   return (
     <div className="container mt-4">
-      <h1 className="mb-3">🎵 Music Consolidation Review</h1>
+      <img src="src/assets/logo_web.png" alt="Pedro Organiza Logo" className="logo" />
+      <h1 className="mb-3">🎵 Pedro Organiza -  Music Manager</h1>
 
       {loading ? (
         <div className="alert alert-info">Loading files…</div>

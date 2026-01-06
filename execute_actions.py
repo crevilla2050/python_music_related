@@ -17,7 +17,15 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
-DEFAULT_DB = "music_consolidation.db"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_PATH = os.getenv("MUSIC_DB")
+if not DB_PATH:
+    raise SystemExit("[ERROR] MUSIC_DB not set in .env")
+
 VALID_ACTIONS = {"move", "archive", "delete", "skip"}
 
 

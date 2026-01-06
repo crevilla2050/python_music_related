@@ -2,8 +2,15 @@ import { useState, useRef, useMemo } from "react";
 
 /* ---------- helpers ---------- */
 
+/**
+ * Checks if a value is considered "unknown"
+ * @param {string} value - The value to check
+ * @returns {boolean} - True if the value is null, undefined, empty, or starts with "unknown"
+ */
 function isUnknown(value) {
+  // First check if the value is falsy (null, undefined, empty string, etc.)
   if (!value) return true;
+  // Check if the lowercase version of the value starts with "unknown"
   return value.toLowerCase().startsWith("unknown");
 }
 

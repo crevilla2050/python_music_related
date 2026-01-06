@@ -1,115 +1,339 @@
 """
 new_pedro_tagger.py
 
-Pedro v2 (NO AcoustID key required):
-- Local fingerprint awareness (already in DB)
-- MusicBrainz text-based enrichment
-- Honest confidence reporting
-- Safe for FastAPI integration
+Pedro tag enrichment engine.
+
+Responsibilities:
+- Suggest metadata (artist / album / title / album_artist / compilation)
+- Never overwrite existing confirmed data
+- Provide confidence + source attribution
+- Fallback to SOURCE PATH inference when all else fails
+- Suggest album art (never embed, never mutate filesystem)
 """
 
 import os
-import logging
-import musicbrainzngs
+import re
+import unicodedata
+import hashlib
+import mimetypes
+from typing import Optional, Dict, List
 
-# ---------------- logging ----------------
-log = logging.getLogger("pedro")
+from mutagen import File as MutagenFile
 
-# ---------------- MusicBrainz config ----------------
-musicbrainzngs.set_useragent(
-    "MusicConsolidator",
-    "2.0",
-    "you@example.com"
-)
+# -------------------------------
+# Constants
+# -------------------------------
 
-# ---------------- helpers ----------------
-def _guess_from_filename(filepath: str):
-    name = os.path.splitext(os.path.basename(filepath))[0]
-    if "-" not in name:
-        return None, None
-    artist, title = map(str.strip, name.split("-", 1))
-    return artist, title
+COVER_KEYWORDS = [
+    "cover",
+    "folder",
+    "front",
+    "albumart",
+]
+
+SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-def _search_musicbrainz(artist: str, title: str):
+# -------------------------------
+# Utilities
+# -------------------------------
+
+def normalize(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.strip()
+
+
+def clean_token(s: str) -> str:
+    s = normalize(s)
+    s = re.sub(r'[_]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+
+def filename_to_title(filename: str) -> str:
+    name = os.path.splitext(os.path.basename(filename))[0]
+    name = re.sub(r'^\d+\s*[-._]\s*', '', name)
+    return clean_token(name)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# -------------------------------
+# Embedded metadata extraction
+# -------------------------------
+
+def extract_existing_tags(path: str) -> Dict[str, Optional[str]]:
     try:
-        result = musicbrainzngs.search_recordings(
-            artist=artist,
-            recording=title,
-            limit=1
-        )
+        audio_easy = MutagenFile(path, easy=True)
+        audio_raw = MutagenFile(path, easy=False)
 
-        recs = result.get("recording-list", [])
-        if not recs:
-            return None
+        if not audio_easy:
+            return {}
 
-        rec = recs[0]
-        artist_name = rec["artist-credit"][0]["artist"]["name"]
-        title_name = rec["title"]
-        album_name = None
+        album_artist = audio_easy.get("albumartist", [None])[0]
+        is_compilation = False
 
-        if rec.get("release-list"):
-            album_name = rec["release-list"][0]["title"]
+        # iTunes / ID3 / MP4 compilation flags
+        if audio_raw and hasattr(audio_raw, "tags"):
+            for key in audio_raw.tags.keys():
+                if str(key).lower() in ("tcmp", "compilation", "cpil"):
+                    is_compilation = True
+                    break
 
         return {
-            "artist": artist_name,
-            "title": title_name,
-            "album": album_name
+            "artist": audio_easy.get("artist", [None])[0],
+            "album": audio_easy.get("album", [None])[0],
+            "title": audio_easy.get("title", [None])[0],
+            "album_artist": album_artist,
+            "is_compilation": is_compilation,
         }
 
     except Exception:
-        log.exception("MusicBrainz search failed")
-        return None
+        return {}
 
 
-# ---------------- public API ----------------
-def pedro_enrich_file(filepath: str, artist_hint=None, title_hint=None) -> dict:
+# -------------------------------
+# SOURCE PATH inference
+# -------------------------------
+
+def infer_tags_from_source_path(path: str) -> Dict[str, str]:
     """
-    Pedro enrichment (suggestions only, NEVER authoritative)
+    Conservative heuristic:
+        Artist / Album / Track.ext
+    """
+    parts: List[str] = []
+    p = os.path.normpath(path)
+
+    while True:
+        p, tail = os.path.split(p)
+        if tail:
+            parts.append(tail)
+        else:
+            break
+
+    parts = list(reversed(parts))
+    inferred = {}
+
+    if len(parts) >= 3:
+        inferred["artist"] = clean_token(parts[-3])
+        inferred["album"] = clean_token(parts[-2])
+        inferred["title"] = filename_to_title(parts[-1])
+
+    elif len(parts) == 2:
+        inferred["album"] = clean_token(parts[-2])
+        inferred["title"] = filename_to_title(parts[-1])
+
+    elif len(parts) == 1:
+        inferred["title"] = filename_to_title(parts[-1])
+
+    return {k: v for k, v in inferred.items() if v}
+
+
+# -------------------------------
+# Album art helpers
+# -------------------------------
+
+def _find_sibling_cover(source_paths: List[str]):
+    """
+    Look for sibling cover images near source audio files.
+    Highest confidence signal.
+    """
+    checked_dirs = set()
+
+    for path in source_paths:
+        directory = os.path.dirname(path)
+        if directory in checked_dirs:
+            continue
+
+        checked_dirs.add(directory)
+
+        try:
+            for fname in os.listdir(directory):
+                fname_l = fname.lower()
+                ext = os.path.splitext(fname_l)[1]
+
+                if ext not in SUPPORTED_IMAGE_EXTS:
+                    continue
+
+                if not any(k in fname_l for k in COVER_KEYWORDS):
+                    continue
+
+                img_path = os.path.join(directory, fname)
+                with open(img_path, "rb") as f:
+                    data = f.read()
+
+                mime, _ = mimetypes.guess_type(img_path)
+                mime = mime or "application/octet-stream"
+
+                return {
+                    "image_bytes": data,
+                    "image_hash": sha256_bytes(data),
+                    "mime": mime,
+                    "source": "sibling",
+                    "confidence": 0.98,
+                    "notes": f"Found sibling image: {fname}",
+                }
+
+        except Exception:
+            continue
+
+    return None
+
+
+# -------------------------------
+# Pedro: album art suggestion
+# -------------------------------
+
+def pedro_suggest_album_art(
+    album_artist: Optional[str],
+    album: Optional[str],
+    is_compilation: bool,
+    source_paths: List[str],
+) -> Dict:
+    """
+    Suggest album art.
+    Advisory only. No embedding. No mutation.
     """
 
-    if not os.path.isfile(filepath):
+    # 1️⃣ sibling image (highest confidence)
+    sibling = _find_sibling_cover(source_paths)
+    if sibling:
         return {
-            "source": "pedro",
-            "confidence": 0,
-            "reason": "file_not_found"
+            "success": True,
+            "status": "found",
+            **sibling,
         }
 
-    # Priority 1: explicit user input
-    if artist_hint and title_hint:
-        tags = _search_musicbrainz(artist_hint, title_hint)
+    # 2️⃣ network sources (hooks only for now)
+    if album and (album_artist or is_compilation):
+        return {
+            "success": False,
+            "status": "missing",
+            "source": "network_placeholder",
+            "confidence": 0.0,
+            "image_bytes": None,
+            "image_hash": None,
+            "mime": None,
+            "notes": "Network sources not queried yet",
+        }
+
+    # 3️⃣ nothing found
+    return {
+        "success": False,
+        "status": "missing",
+        "source": "none",
+        "confidence": 0.0,
+        "image_bytes": None,
+        "image_hash": None,
+        "mime": None,
+        "notes": "No album art candidates found",
+    }
+
+
+# -------------------------------
+# Pedro: file enrichment
+# -------------------------------
+
+def pedro_enrich_file(
+    source_path: str,
+    artist_hint: Optional[str] = None,
+    title_hint: Optional[str] = None,
+    album_artist_hint: Optional[str] = None,
+    is_compilation_hint: Optional[bool] = None,
+) -> Dict:
+    """
+    Suggest tags for a single file.
+    """
+
+    existing = extract_existing_tags(source_path)
+    tags = {}
+
+    if existing:
+        for k in ("artist", "album", "title", "album_artist"):
+            if existing.get(k):
+                tags[k] = normalize(existing[k])
+
+        if existing.get("is_compilation"):
+            tags["is_compilation"] = True
+
         if tags:
             return {
-                "source": "musicbrainz",
-                "method": "manual_hints",
-                "confidence": 0.75,
-                "suggested": {
-                    "artist": tags.get("artist"),
-                    "album": tags.get("album"),
-                    "title": tags.get("title"),
-                    "track": None
-                }
+                "success": True,
+                "tags": tags,
+                "confidence": 0.95,
+                "source": "file_metadata",
+                "notes": "Existing embedded tags",
             }
 
-    # Priority 2: filename guess
-    artist_guess, title_guess = _guess_from_filename(filepath)
-    if artist_guess and title_guess:
-        tags = _search_musicbrainz(artist_guess, title_guess)
-        if tags:
-            return {
-                "source": "musicbrainz",
-                "method": "filename_guess",
-                "confidence": 0.60,
-                "suggested": {
-                    "artist": tags.get("artist"),
-                    "album": tags.get("album"),
-                    "title": tags.get("title"),
-                    "track": None
-                }
-            }
+    # Context hints
+    if any(v is not None for v in (artist_hint, title_hint, album_artist_hint, is_compilation_hint)):
+        if artist_hint:
+            tags["artist"] = normalize(artist_hint)
+        if title_hint:
+            tags["title"] = normalize(title_hint)
+        if album_artist_hint:
+            tags["album_artist"] = normalize(album_artist_hint)
+        if is_compilation_hint is not None:
+            tags["is_compilation"] = bool(is_compilation_hint)
+
+        return {
+            "success": True,
+            "tags": tags,
+            "confidence": 0.60,
+            "source": "context_hints",
+            "notes": "Provided contextual hints",
+        }
+
+    # Source path inference
+    inferred = infer_tags_from_source_path(source_path)
+    if inferred:
+        return {
+            "success": True,
+            "tags": inferred,
+            "confidence": 0.45,
+            "source": "source_path_inference",
+            "notes": "Inferred from original filesystem path",
+        }
 
     return {
-        "source": "musicbrainz",
-        "confidence": 0,
-        "reason": "no_match"
+        "success": False,
+        "tags": {},
+        "confidence": 0.0,
+        "source": "none",
+        "notes": "No reliable metadata found",
+    }
+
+
+# -------------------------------
+# Pedro: cluster enrichment
+# -------------------------------
+
+def pedro_enrich_cluster(
+    album_artist: Optional[str],
+    album: Optional[str],
+    is_compilation: bool,
+    source_paths: List[str],
+) -> Dict:
+    """
+    Album-level enrichment (currently album art only).
+    """
+
+    art = pedro_suggest_album_art(
+        album_artist=album_artist,
+        album=album,
+        is_compilation=bool(is_compilation),
+        source_paths=source_paths,
+    )
+
+    return {
+        "success": art.get("success", False),
+        "album_artist": album_artist,
+        "album": album,
+        "is_compilation": is_compilation,
+        "art": art,
     }

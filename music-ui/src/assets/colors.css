@@ -1,0 +1,46 @@
+/* =========================================================
+   Pedro Organiza — Color Palette
+   Derived from logo branding
+   ========================================================= */
+
+/* ---------- Base / Background ---------- */
+:root {
+  --color-bg-primary: #0b0e1a;      /* Main dark background */
+  --color-bg-secondary: #14182c;    /* Panels / cards */
+  --color-bg-tertiary: #1e2442;     /* Elevated surfaces */
+
+  /* ---------- Brand Blues & Purples ---------- */
+  --color-brand-blue: #3fa9f5;      /* Folder blue */
+  --color-brand-blue-dark: #1f6fb2; /* Deep blue accents */
+  --color-brand-purple: #7b4fe9;    /* Purple gradient edge */
+  --color-brand-purple-dark: #4b2ea6;
+
+  /* ---------- Accent Colors ---------- */
+  --color-accent-orange: #ff8a00;   /* "Organiza" text */
+  --color-accent-orange-dark: #e36f00;
+  --color-accent-yellow: #ffd34d;   /* Equalizer bars / highlights */
+
+  /* ---------- Text Colors ---------- */
+  --color-text-primary: #ffffff;    /* Main text */
+  --color-text-secondary: #b8c6ff;  /* Subtitles / labels */
+  --color-text-muted: #8a90b8;      /* Disabled / hints */
+  --color-text-inverse: #0b0e1a;    /* Text on light backgrounds */
+
+  /* ---------- UI Utility ---------- */
+  --color-border: #2a3160;
+  --color-divider: #1f2547;
+  --color-shadow: rgba(0, 0, 0, 0.45);
+
+  /* ---------- Gradients ---------- */
+  --gradient-brand-primary: linear-gradient(
+    135deg,
+    var(--color-brand-blue),
+    var(--color-brand-purple)
+  );
+
+  --gradient-accent-warm: linear-gradient(
+    135deg,
+    var(--color-accent-yellow),
+    var(--color-accent-orange)
+  );
+}

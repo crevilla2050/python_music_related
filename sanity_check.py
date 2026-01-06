@@ -2,7 +2,7 @@
 """
 sanity_check.py
 
-Sanity checks for music_consolidation.db (NEW SCHEMA)
+Sanity checks for music_consolidation database (NEW SCHEMA)
 
 Checks:
 - files table exists
@@ -17,9 +17,18 @@ Checks:
 import sqlite3
 from collections import Counter
 from pathlib import Path
+import os
+from dotenv import load_dotenv
 
-DB_PATH = "music_consolidation.db"
+# ===================== ENV =====================
 
+load_dotenv()
+
+DB_PATH = os.getenv("MUSIC_DB")
+if not DB_PATH:
+    raise SystemExit("[ERROR] MUSIC_DB not set in .env")
+
+# ===================== Helpers =====================
 
 def print_header(title):
     print("\n" + "=" * 60)
@@ -128,7 +137,7 @@ def check_inconsistent_rows(conn):
     """)
     n = c.fetchone()[0]
     if n:
-        print(f"  [!] {n} rows: status=unique but action={archive/delete}")
+        print(f"  [!] {n} rows: status=unique but action=archive/delete")
         problems += n
 
     if problems == 0:
@@ -136,7 +145,9 @@ def check_inconsistent_rows(conn):
 
 
 def main():
-    print_header("MUSIC CONSOLIDATION — SANITY CHECK (NEW SCHEMA)")
+    print_header("MUSIC CONSOLIDATION — SANITY CHECK (ACTIVE DB)")
+    print(f"[DB] Using: {DB_PATH}")
+
     conn = connect_db()
 
     total = check_total_rows(conn)
