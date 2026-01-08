@@ -9,6 +9,21 @@ Responsibilities:
 - Provide confidence + source attribution
 - Fallback to SOURCE PATH inference when all else fails
 - Suggest album art (never embed, never mutate filesystem)
+
+This module provides a conservative, advisory-only tagging assistant
+called "Pedro". It reads embedded metadata, accepts optional context
+hints, and falls back to safe heuristics based on source paths. Any
+suggestions include a confidence score and a `source` field so callers
+can decide whether to apply the suggestion.
+
+Usage (example):
+    from tools import new_pedro_tagger
+    suggestion = new_pedro_tagger.pedro_enrich_file('/path/to/track.mp3')
+
+Important: functions in this module do not modify audio files.
+They return dictionaries describing suggested tags and album-art
+metadata; another part of the system is responsible for applying
+changes after user confirmation.
 """
 
 import os
@@ -104,6 +119,8 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+
+
 # -------------------------------
 # Embedded metadata extraction
 # -------------------------------
@@ -120,22 +137,28 @@ def extract_existing_tags(path: str) -> Dict[str, Optional[str]]:
     dict and allow lower-confidence inference to proceed.
     """
     try:
+        # `easy=True` yields the human-friendly keys (e.g. 'artist',
+        # 'album') with lists of values. `easy=False` returns the raw
+        # backend object which can contain format-specific flags used
+        # to detect compilations on MP4/iTunes files.
         audio_easy = MutagenFile(path, easy=True)
         audio_raw = MutagenFile(path, easy=False)
 
         if not audio_easy:
+            # Mutagen couldn't parse the file or it is unsupported.
             return {}
 
         album_artist = audio_easy.get("albumartist", [None])[0]
         is_compilation = False
 
-        # iTunes / ID3 / MP4 compilation flags
+        # Detect compilation flags across different container/tag types.
         if audio_raw and hasattr(audio_raw, "tags"):
             for key in audio_raw.tags.keys():
                 if str(key).lower() in ("tcmp", "compilation", "cpil"):
                     is_compilation = True
                     break
 
+        # Return a compact mapping of the common fields we care about.
         return {
             "artist": audio_easy.get("artist", [None])[0],
             "album": audio_easy.get("album", [None])[0],
@@ -145,6 +168,8 @@ def extract_existing_tags(path: str) -> Dict[str, Optional[str]]:
         }
 
     except Exception:
+        # Be defensive: if tag parsing fails, downstream heuristics will
+        # still attempt to propose reasonable suggestions.
         return {}
 
 
@@ -170,6 +195,10 @@ def infer_tags_from_source_path(path: str) -> Dict[str, str]:
     parts = list(reversed(parts))
     inferred = {}
 
+    # We interpret path segments conservatively: when the tree depth
+    # suggests `.../Artist/Album/Track`, we use those parts. This avoids
+    # aggressive guessing when files are stored in arbitrary nested
+    # folders.
     if len(parts) >= 3:
         inferred["artist"] = clean_token(parts[-3])
         inferred["album"] = clean_token(parts[-2])
@@ -208,6 +237,10 @@ def _find_sibling_cover(source_paths: List[str]):
                 fname_l = fname.lower()
                 ext = os.path.splitext(fname_l)[1]
 
+                # Only consider files with supported image extensions and
+                # conservative filename matches (e.g. 'cover.jpg',
+                # 'folder.png'). This helps avoid false positives like
+                # artwork thumbnails or unrelated images.
                 if ext not in SUPPORTED_IMAGE_EXTS:
                     continue
 
@@ -218,16 +251,24 @@ def _find_sibling_cover(source_paths: List[str]):
                 with open(img_path, "rb") as f:
                     data = f.read()
 
+                # Guess mime type for downstream consumers; default to a
+                # generic binary mime if detection fails.
                 mime, _ = mimetypes.guess_type(img_path)
                 mime = mime or "application/octet-stream"
 
+                # Return on first reasonable match: sibling images are a
+                # very strong signal and we prefer the first located file
+                # to keep behavior deterministic.
                 return {
                     "image_bytes": data,
                     "image_hash": sha256_bytes(data),
                     "mime": mime,
                     "source": "sibling",
                     "confidence": 0.98,
-                    "notes": f"Found sibling image: {fname}",
+                    "notes": {
+                        "key": "ALBUM_ART_SIBLING_FOUND",
+                        "params": {"filename": fname}
+                    },
                 }
 
         except Exception:
@@ -261,6 +302,9 @@ def pedro_suggest_album_art(
         }
 
     # 2️⃣ network sources (hooks only for now)
+    # Placeholder branch: network fetches / online lookups are intentionally
+    # unimplemented in this module — callers may extend or replace this
+    # behaviour with a richer provider if desired.
     if album and (album_artist or is_compilation):
         return {
             "success": False,
@@ -270,7 +314,9 @@ def pedro_suggest_album_art(
             "image_bytes": None,
             "image_hash": None,
             "mime": None,
-            "notes": "Network sources not queried yet",
+            "notes": {
+                "key": "ALBUM_ART_NETWORK_NOT_IMPLEMENTED"
+            },
         }
 
     # 3️⃣ nothing found
@@ -282,7 +328,9 @@ def pedro_suggest_album_art(
         "image_bytes": None,
         "image_hash": None,
         "mime": None,
-        "notes": "No album art candidates found",
+        "notes": {
+            "key": "ALBUM_ART_NOT_FOUND"
+        },
     }
 
 
@@ -301,6 +349,9 @@ def pedro_enrich_file(
     Suggest tags for a single file.
     """
 
+    # Priority 1: embedded tags (highest confidence). If useful fields
+    # exist in the file metadata, return them immediately so callers can
+    # surface them to users without performing further inference.
     existing = extract_existing_tags(source_path)
     tags = {}
 
@@ -318,10 +369,14 @@ def pedro_enrich_file(
                 "tags": tags,
                 "confidence": 0.95,
                 "source": "file_metadata",
-                "notes": "Existing embedded tags",
+                "notes": {
+                    "key": "TAGGER_EXISTING_METADATA"
+                },
             }
 
-    # Context hints
+    # Priority 2: explicit context hints provided by the caller. These are
+    # treated as medium-confidence signals because they usually originate
+    # from user input or UI state.
     if any(v is not None for v in (artist_hint, title_hint, album_artist_hint, is_compilation_hint)):
         if artist_hint:
             tags["artist"] = normalize(artist_hint)
@@ -337,10 +392,13 @@ def pedro_enrich_file(
             "tags": tags,
             "confidence": 0.60,
             "source": "context_hints",
-            "notes": "Provided contextual hints",
+            "notes": {
+                "key": "TAGGER_CONTEXT_HINTS"
+            },
         }
 
-    # Source path inference
+    # Priority 3: conservative source-path inference when no higher
+    # confidence data is available.
     inferred = infer_tags_from_source_path(source_path)
     if inferred:
         return {
@@ -348,7 +406,9 @@ def pedro_enrich_file(
             "tags": inferred,
             "confidence": 0.45,
             "source": "source_path_inference",
-            "notes": "Inferred from original filesystem path",
+            "notes": {
+                "key": "TAGGER_SOURCE_PATH_INFERENCE"
+            },
         }
 
     return {
@@ -356,7 +416,10 @@ def pedro_enrich_file(
         "tags": {},
         "confidence": 0.0,
         "source": "none",
-        "notes": "No reliable metadata found",
+        "notes": {
+            "key": "TAGGER_NO_METADATA"
+        },
+
     }
 
 

@@ -1,85 +1,170 @@
 #!/usr/bin/env python3
 """
-resize_images.py
+backend/resize_images.py
 
-Recursively crawls through a given directory (passed as a command line argument)
-and resizes all found images to a maximum of 2500px in height or width,
-preserving aspect ratio.
+Album-art normalization utility used by Pedro Organiza.
 
-Usage:
-    python resize_images.py /path/to/directory
+This module provides a single, well-tested helper `normalize_image`
+that converts common image formats to deterministic, square JPEGs with
+EXIF removed and controlled dimensions. The function is intentionally
+conservative (no upscaling by default) and supports a `return_bytes`
+mode for callers that want an in-memory JPEG rather than writing to
+disk.
 
-Dependencies:
-    - Pillow (PIL) library for image processing.
-      Install with: pip install Pillow
+Normalization goals:
+- Produce square images via center crop
+- Remove EXIF metadata and fix orientation via EXIF transpose
+- Resize down to `max_size` while optionally avoiding upscaling
+- Output JPEG with predictable quality and progressive encoding
 """
 
 import sys
-import os
-from PIL import Image
+import io
+from pathlib import Path
+from PIL import Image, ImageOps
 
-# Supported image extensions
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+from backend.i18n.messages import msg
 
-MAX_DIMENSION = 2500
+# ---------------- CONFIG ----------------
 
-def resize_image(image_path):
+MAX_SIZE = 1024
+MIN_SIZE = 300
+JPEG_QUALITY = 90
+
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+# ---------------- CORE LOGIC ----------------
+
+def normalize_image(
+    src_path: Path,
+    dst_path: Path | None = None,
+    *,
+    max_size: int = MAX_SIZE,
+    min_size: int = MIN_SIZE,
+    jpeg_quality: int = JPEG_QUALITY,
+    allow_upscale: bool = False,
+    return_bytes: bool = False,
+) -> bool | bytes:
+    """
+    Normalize a single image.
+
+    Modes:
+    - return_bytes = False (default):
+        Writes normalized image to dst_path or src_path.
+        Returns True if written, False if skipped.
+    - return_bytes = True:
+        Does NOT write to disk.
+        Returns JPEG bytes if successful, None if skipped.
+
+    Rules:
+    - EXIF orientation fixed
+    - EXIF stripped
+    - Center-crop to square
+    - Resize down to max_size
+    - No upscaling by default
+    """
+
     try:
-        with Image.open(image_path) as img:
-            width, height = img.size
-            if width <= MAX_DIMENSION and height <= MAX_DIMENSION:
-                # No resizing needed
-                return False
+        with Image.open(src_path) as img:
+            # Apply EXIF transpose to fix orientation and remove EXIF
+            img = ImageOps.exif_transpose(img)
 
-            # Calculate new size preserving aspect ratio
-            if width > height:
-                new_width = MAX_DIMENSION
-                new_height = int((MAX_DIMENSION / width) * height)
+            # Work in RGB to have deterministic bytes regardless of input
+            img = img.convert("RGB")
+            w, h = img.size
+
+            # Reject images that are too small to be useful
+            if w < min_size or h < min_size:
+                return None if return_bytes else False
+
+            # Center-crop to a square based on the smaller side
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+
+            # Resize behaviour:
+            # - If the image is larger than `max_size`, scale down.
+            # - If the image is smaller and upscaling is disallowed, keep
+            #   the current size (caller may treat this as 'skip').
+            if side > max_size:
+                img = img.resize((max_size, max_size), Image.LANCZOS)
+            elif side < max_size and not allow_upscale:
+                # Intentionally do nothing (we will return 'skipped')
+                pass
             else:
-                new_height = MAX_DIMENSION
-                new_width = int((MAX_DIMENSION / height) * width)
+                img = img.resize((max_size, max_size), Image.LANCZOS)
 
-            resized_img = img.resize((new_width, new_height), Image.LANCZOS)
-            resized_img.save(image_path)
-            print(f"Resized: {image_path} from {width}x{height} to {new_width}x{new_height}")
+            # Return bytes mode: useful for embedding or in-memory flows
+            if return_bytes:
+                buf = io.BytesIO()
+                img.save(
+                    buf,
+                    format="JPEG",
+                    quality=jpeg_quality,
+                    optimize=True,
+                    progressive=True,
+                )
+                return buf.getvalue()
+
+            # File mode: write to `dst_path` if provided, otherwise overwrite
+            # the source image with the normalized JPEG.
+            out_path = dst_path or src_path
+
+            img.save(
+                out_path,
+                "JPEG",
+                quality=jpeg_quality,
+                optimize=True,
+                progressive=True,
+            )
+
             return True
-    except Exception as e:
-        print(f"Error processing {image_path}: {e}")
-        return False
 
-def crawl_and_resize(directory):
-    # Initialize counters for total images and resized images
-    total_images = 0
-    resized_count = 0
-    # Walk through the directory and its subdirectories
-    for root, _, files in os.walk(directory):
-        # Iterate through each file in the directory
-        for file in files:
-            # Get the file extension
-            ext = os.path.splitext(file)[1].lower()
-            # Check if the file extension is in the list of image extensions
-            if ext in IMAGE_EXTENSIONS:
-                # Increment the total images counter
-                total_images += 1
-                # Get the full path of the image
-                image_path = os.path.join(root, file)
-                # Resize the image and increment the resized images counter if successful
-                if resize_image(image_path):
-                    resized_count += 1
-    # Print the total number of images processed and the number of images resized
-    print(f"Processed {total_images} images, resized {resized_count} images.")
+    except Exception:
+        # Fail permissively: callers usually treat False/None as 'skipped'
+        return None if return_bytes else False
+
+
+# ---------------- CLI ----------------
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python resize_images.py /path/to/directory")
+    if len(sys.argv) < 2:
+        print(msg("RESIZE_USAGE"))
         sys.exit(1)
 
-    directory = sys.argv[1]
-    if not os.path.isdir(directory):
-        print(f"Error: {directory} is not a valid directory.")
+    target = Path(sys.argv[1])
+
+    if target.is_file():
+        ok = normalize_image(target)
+        print(msg("RESIZE_OK") if ok else msg("RESIZE_SKIPPED"))
+        return
+
+    if not target.is_dir():
+        print(msg("RESIZE_INVALID_PATH"))
         sys.exit(1)
 
-    crawl_and_resize(directory)
+    processed = 0
+    skipped = 0
+
+    for p in target.rglob("*"):
+        if p.suffix.lower() not in SUPPORTED_EXTS:
+            continue
+
+        if normalize_image(p):
+            processed += 1
+        else:
+            skipped += 1
+
+    print(
+        msg("RESIZE_SUMMARY").format(
+            processed=processed,
+            skipped=skipped
+        )
+    )
+
 
 if __name__ == "__main__":
     main()
+
+# ---------------- END OF FILE ----------------

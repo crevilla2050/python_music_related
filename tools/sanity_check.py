@@ -2,24 +2,15 @@
 """
 sanity_check.py
 
-Small utility to perform sanity checks on the SQLite staging database
-created by the consolidation pipeline. This script is intentionally
-lightweight and prints human-friendly summaries that help an operator
-quickly spot obvious problems before moves/renames are applied.
+Pedro Organiza — Pre-Execution Sanity Audit
 
-Checks performed:
-- files table row count
-- distribution of `action` and `status` values
-- clusters of identical fingerprints (perceptual duplicates)
-- clusters of identical SHA-256 hashes (exact duplicates)
-- simple logical inconsistencies between `status` and `action`
+Purpose:
+- Validate database coherence before execution
+- Detect dangerous or inconsistent states
+- Provide human-readable diagnostics
+- NEVER mutate data
 
-Usage:
-1. Ensure the consolidation script has written `MUSIC_DB` into `.env`.
-2. Run this script; it will read the database and print summaries.
-
-This file focuses on clarity rather than performance: queries fetch
-small result sets and print concise diagnostics for manual inspection.
+Layer: Safety / Audit
 """
 
 import sqlite3
@@ -28,186 +19,141 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 
-# ===================== ENV =====================
+# ---------------- I18N KEYS ----------------
+
+MSG_HEADER = "SANITY_CHECK_HEADER"
+MSG_DB_PATH = "SANITY_DB_PATH"
+MSG_TOTAL_FILES = "SANITY_TOTAL_FILES"
+MSG_LIFECYCLE_DIST = "SANITY_LIFECYCLE_DISTRIBUTION"
+MSG_ACTION_DIST = "SANITY_ACTION_DISTRIBUTION"
+MSG_ACTION_STATUS_DIST = "SANITY_ACTION_STATUS_DISTRIBUTION"
+MSG_ORPHAN_ACTIONS = "SANITY_ORPHAN_ACTIONS"
+MSG_MULTIPLE_PENDING = "SANITY_MULTIPLE_PENDING_ACTIONS"
+MSG_MISSING_DST = "SANITY_MISSING_DST"
+MSG_SHA_CLUSTERS = "SANITY_SHA_CLUSTERS"
+MSG_FP_CLUSTERS = "SANITY_FP_CLUSTERS"
+MSG_ERRORS = "SANITY_ERRORS"
+MSG_DONE = "SANITY_DONE"
+
+# -------------------------------------------
 
 load_dotenv()
 
-# The consolidation pipeline writes the active DB filename to `.env`
-# as `MUSIC_DB`. This allows helper scripts (like this one) to find
-# and open the current database without requiring complex CLI flags.
 DB_PATH = os.getenv("MUSIC_DB")
 if not DB_PATH:
-    # Fail early with a clear message rather than using a default.
-    raise SystemExit("[ERROR] MUSIC_DB not set in .env")
-
-# ===================== Helpers =====================
-
-def print_header(title):
-    # Nicely formatted title for each run so outputs are easy to scan.
-    print("\n" + "=" * 60)
-    print(title)
-    print("=" * 60)
+    raise SystemExit({"key": "ERROR_DB_NOT_SET"})
 
 
 def connect_db():
-    # Verify the DB file exists before attempting to connect. A common
-    # mistake is running this script from a different working directory
-    # where `.env` was created, so an explicit check produces a clearer
-    # error message than a raw sqlite3 exception.
     if not Path(DB_PATH).exists():
-        raise SystemExit(f"[ERROR] DB not found: {DB_PATH}")
-    return sqlite3.connect(DB_PATH)
+        raise SystemExit({"key": "ERROR_DB_NOT_FOUND", "params": {"path": DB_PATH}})
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def check_total_rows(conn):
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM files")
-    total = c.fetchone()[0]
-    # Report the total number of rows stored in the `files` table.
-    # Zero rows most often means the analysis is still running or the
-    # wrong DB was selected.
-    print(f"[DB] Total rows in files table: {total}")
-    return total
-
-
-def check_action_distribution(conn):
-    c = conn.cursor()
-    c.execute("SELECT action FROM files")
-    actions = [r[0] for r in c.fetchall()]
-    # Show how many rows are marked with each `action` (e.g. move,
-    # archive, delete). This helps verify that the consolidation
-    # policy is producing the expected distribution before any file
-    # operations run.
-    print("\n[DB] Action distribution:")
-    if not actions:
-        print("  (no rows)")
-        return
-    for k, v in Counter(actions).items():
-        print(f"  {k:<10} {v}")
-
-
-def check_status_distribution(conn):
-    c = conn.cursor()
-    c.execute("SELECT status FROM files")
-    statuses = [r[0] for r in c.fetchall()]
-    # Show the `status` histogram (e.g. unique, duplicate). This
-    # complements the action distribution and can reveal unexpected
-    # outcomes from the duplicate detection stage.
-    print("\n[DB] Status distribution:")
-    if not statuses:
-        print("  (no rows)")
-        return
-    for k, v in Counter(statuses).items():
-        print(f"  {k:<12} {v}")
-
-
-def check_fingerprint_duplicates(conn):
-    c = conn.cursor()
-    c.execute("""
-        SELECT fingerprint, COUNT(*)
-        FROM files
-        WHERE fingerprint IS NOT NULL
-        GROUP BY fingerprint
-        HAVING COUNT(*) > 1
-    """)
-    rows = c.fetchall()
-    # List groups of files that share the same perceptual fingerprint.
-    # These clusters suggest perceptual duplicates — different file
-    # encodings, bitrates, or small edits of the same audio content.
-    print("\n[DB] Fingerprint duplicate clusters:")
-    if not rows:
-        print("  None found")
-        return
-    for fp, count in rows:
-        # Only show a short prefix of the fingerprint hash to keep the
-        # output readable; the full value is stored in the DB if needed.
-        print(f"  fingerprint={fp[:12]}…  count={count}")
-
-
-def check_sha256_duplicates(conn):
-    c = conn.cursor()
-    c.execute("""
-        SELECT sha256, COUNT(*)
-        FROM files
-        WHERE sha256 IS NOT NULL
-        GROUP BY sha256
-        HAVING COUNT(*) > 1
-    """)
-    rows = c.fetchall()
-    # Exact-file duplicates (identical bytes) are grouped by SHA-256.
-    # These are safe to dedupe automatically, but it's good to spot
-    # any unexpectedly large clusters which may indicate mass repeats.
-    print("\n[DB] SHA-256 duplicate clusters:")
-    if not rows:
-        print("  None found")
-        return
-    for sha, count in rows:
-        print(f"  sha256={sha[:12]}…  count={count}")
-
-
-def check_inconsistent_rows(conn):
-    """
-    Run simple logical consistency checks across `status` and `action`.
-
-    These checks are intentionally conservative: they flag rows that
-    almost certainly indicate user error or a logic bug in earlier
-    pipeline stages (for example, a duplicate flagged as 'move').
-    """
-    c = conn.cursor()
-
-    print("\n[DB] Inconsistent rows:")
-
-    problems = 0
-
-    # Case 1: a row is marked as a duplicate but the selected action
-    # is `move`. Typically, duplicates should be archived or deleted
-    # rather than moved into the canonical library.
-    c.execute("""
-        SELECT COUNT(*) FROM files
-        WHERE status='duplicate' AND action='move'
-    """)
-    n = c.fetchone()[0]
-    if n:
-        print(f"  [!] {n} rows: status=duplicate but action=move")
-        problems += n
-
-    # Case 2: a row is marked as unique but the selected action is to
-    # archive or delete it. That combination is suspicious and worth
-    # human review before any destructive action.
-    c.execute("""
-        SELECT COUNT(*) FROM files
-        WHERE status='unique' AND action IN ('archive','delete')
-    """)
-    n = c.fetchone()[0]
-    if n:
-        print(f"  [!] {n} rows: status=unique but action=archive/delete")
-        problems += n
-
-    if problems == 0:
-        print("  No inconsistencies found")
+def print_section(title_key):
+    print("\n" + "=" * 70)
+    print(title_key)
+    print("=" * 70)
 
 
 def main():
-    # Toplevel runner: open the DB, perform each check in sequence, and
-    # close the connection. The script prints warnings rather than
-    # raising exceptions so it can be used interactively by operators.
-    print_header("MUSIC CONSOLIDATION — SANITY CHECK (ACTIVE DB)")
-    print(f"[DB] Using: {DB_PATH}")
+    print_section(MSG_HEADER)
+    print({ "key": MSG_DB_PATH, "params": {"path": DB_PATH} })
 
     conn = connect_db()
+    c = conn.cursor()
 
-    total = check_total_rows(conn)
-    if total == 0:
-        print("\n[WARN] Database is empty — analysis may still be running")
+    # ---------- Files ----------
+    c.execute("SELECT COUNT(*) FROM files")
+    total_files = c.fetchone()[0]
+    print({ "key": MSG_TOTAL_FILES, "params": {"count": total_files} })
 
-    check_action_distribution(conn)
-    check_status_distribution(conn)
-    check_fingerprint_duplicates(conn)
-    check_sha256_duplicates(conn)
-    check_inconsistent_rows(conn)
+    c.execute("SELECT lifecycle_state FROM files")
+    lifecycle = Counter(r["lifecycle_state"] for r in c.fetchall())
+    print({ "key": MSG_LIFECYCLE_DIST, "params": dict(lifecycle) })
+
+    # ---------- Actions ----------
+    c.execute("SELECT action FROM actions")
+    actions = Counter(r["action"] for r in c.fetchall())
+    print({ "key": MSG_ACTION_DIST, "params": dict(actions) })
+
+    c.execute("SELECT status FROM actions")
+    action_status = Counter(r["status"] for r in c.fetchall())
+    print({ "key": MSG_ACTION_STATUS_DIST, "params": dict(action_status) })
+
+    # ---------- Orphan actions ----------
+    c.execute("""
+        SELECT COUNT(*) FROM actions
+        WHERE file_id IS NOT NULL
+          AND file_id NOT IN (SELECT id FROM files)
+    """)
+    orphan_count = c.fetchone()[0]
+    if orphan_count:
+        print({ "key": MSG_ORPHAN_ACTIONS, "params": {"count": orphan_count} })
+
+    # ---------- Multiple pending actions ----------
+    c.execute("""
+        SELECT file_id, COUNT(*)
+        FROM actions
+        WHERE status='pending'
+          AND file_id IS NOT NULL
+        GROUP BY file_id
+        HAVING COUNT(*) > 1
+    """)
+    multi = c.fetchall()
+    if multi:
+        print({ "key": MSG_MULTIPLE_PENDING, "params": {"count": len(multi)} })
+
+    # ---------- Missing destination ----------
+    c.execute("""
+        SELECT COUNT(*) FROM actions
+        WHERE action='move'
+          AND status='pending'
+          AND (dst_path IS NULL OR dst_path='')
+    """)
+    missing_dst = c.fetchone()[0]
+    if missing_dst:
+        print({ "key": MSG_MISSING_DST, "params": {"count": missing_dst} })
+
+    # ---------- SHA-256 clusters ----------
+    c.execute("""
+        SELECT COUNT(*) FROM (
+            SELECT sha256
+            FROM files
+            WHERE sha256 IS NOT NULL
+            GROUP BY sha256
+            HAVING COUNT(*) > 1
+        )
+    """)
+    sha_clusters = c.fetchone()[0]
+    print({ "key": MSG_SHA_CLUSTERS, "params": {"count": sha_clusters} })
+
+    # ---------- Fingerprint clusters ----------
+    c.execute("""
+        SELECT COUNT(*) FROM (
+            SELECT fingerprint
+            FROM files
+            WHERE fingerprint IS NOT NULL
+            GROUP BY fingerprint
+            HAVING COUNT(*) > 1
+        )
+    """)
+    fp_clusters = c.fetchone()[0]
+    print({ "key": MSG_FP_CLUSTERS, "params": {"count": fp_clusters} })
+
+    # ---------- Errors ----------
+    c.execute("""
+        SELECT COUNT(*) FROM files
+        WHERE lifecycle_state='error'
+    """)
+    error_files = c.fetchone()[0]
+    if error_files:
+        print({ "key": MSG_ERRORS, "params": {"count": error_files} })
 
     conn.close()
-    print("\n[✓] Sanity check complete")
+    print({ "key": MSG_DONE })
 
 
 if __name__ == "__main__":

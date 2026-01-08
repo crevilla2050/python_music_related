@@ -39,6 +39,25 @@ try:
 except Exception:
     chromaprint = None
 
+# ================= I18N MESSAGE KEYS =================
+
+MSG_DB_NOT_PROVIDED = "DB_NOT_PROVIDED"
+MSG_LIB_NOT_PROVIDED = "LIB_NOT_PROVIDED"
+
+MSG_FOUND_AUDIO_FILES = "FOUND_AUDIO_FILES"
+MSG_ANALYSIS_COMPLETE = "ANALYSIS_COMPLETE"
+
+MSG_SCHEMA_UPGRADE_ADD_COLUMN = "SCHEMA_UPGRADE_ADD_COLUMN"
+
+MSG_LAUNCH_GENRE_NORMALIZATION = "LAUNCH_GENRE_NORMALIZATION"
+MSG_GENRE_NORMALIZATION_FAILED = "GENRE_NORMALIZATION_FAILED"
+
+MSG_START_ANALYSIS = "START_ANALYSIS"
+MSG_SKIP_FILE_STATE = "SKIP_FILE_STATE"
+
+MSG_ACTION_SEEDED = "ACTION_SEEDED"
+
+MSG_ALBUM_ART_SCAN = "ALBUM_ART_SCAN"
 
 # ================= CONFIG =================
 
@@ -49,7 +68,6 @@ COMMON_COVER_NAMES = {"cover", "folder", "front", "album", "albumart"}
 ENABLE_CHROMAPRINT = True
 FP_SECONDS = 90
 DATABASES_DIR = Path("databases")
-
 
 load_dotenv()
 
@@ -91,8 +109,10 @@ def resolve_env_path(key, cli_value=None):
     if value:
         return os.path.abspath(value)
 
-    raise RuntimeError(f"{key} not provided and not found in .env")
-
+    raise RuntimeError({
+        "key": MSG_DB_NOT_PROVIDED if key == "MUSIC_DB" else MSG_LIB_NOT_PROVIDED,
+        "params": {"key": key}
+    })
 
 def resolve_database_path(cli_value=None):
     """
@@ -110,7 +130,10 @@ def resolve_database_path(cli_value=None):
 
     raw = cli_value or os.getenv("MUSIC_DB")
     if not raw:
-        raise RuntimeError("Database path not provided (--db or MUSIC_DB)")
+        raise RuntimeError({
+            "key": MSG_DB_NOT_PROVIDED if key == "MUSIC_DB" else MSG_LIB_NOT_PROVIDED,
+            "params": {"key": key}
+        })
 
     p = Path(raw)
 
@@ -425,7 +448,10 @@ def create_db(db_path):
     def ensure_column(table, column, ddl):
         cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
         if column not in cols:
-            log(f"Schema upgrade: adding {table}.{column}")
+            log({
+                "key": MSG_SCHEMA_UPGRADE_ADD_COLUMN,
+                "params": {"table": table, "column": column}
+            })
             c.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
     ensure_column(
@@ -495,7 +521,10 @@ def analyze_files(
     c = conn.cursor()
 
     audio_list = [p for p in Path(src).rglob("*") if is_audio_file(p)]
-    log(f"Found {len(audio_list)} audio files")
+    log({
+        "key": MSG_FOUND_AUDIO_FILES,
+        "params": {"count": len(audio_list)}
+    })
 
     for p in maybe_progress(audio_list, "Analyzing", progress):
         meta = extract_tags(p)
@@ -596,7 +625,7 @@ def analyze_files(
 
     conn.commit()
     conn.close()
-    log("Analysis complete")
+    log(MSG_ANALYSIS_COMPLETE)
 
 
 # ================= CLI =================
@@ -660,13 +689,15 @@ def main():
     # Optional interactive tag normalization
     # ------------------------------------------------------------
     if args.edit_tags:
-        log("Launching interactive genre normalization")
+        log(MSG_LAUNCH_GENRE_NORMALIZATION)
         try:
             from genre_normalizer_cli import main as genre_cli_main
             genre_cli_main(db_path=db_path)
         except Exception as e:
-            log(f"[ERROR] Genre normalization failed: {e}")
-
+            log({
+                "key": MSG_GENRE_NORMALIZATION_FAILED,
+                "params": {"error": str(e)}
+            })
 
 
 if __name__ == "__main__":

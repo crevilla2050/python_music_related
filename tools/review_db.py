@@ -2,34 +2,42 @@
 """
 review_db.py
 
-Interactive CLI reviewer for music_consolidation.db
+Interactive CLI reviewer for Pedro Organiza.
 
-- Review files one by one
-- Assign action: move | skip | delete | archive | note | quit
-- Edit proposed destination path
-- Resume safely with --continue
-- Designed for very large libraries (30k+ entries)
+Layer: Review / Planning
 
-IMPORTANT:
-This script ONLY updates the database.
-No filesystem operations are performed.
+Responsibilities:
+- Show file metadata + duplicate evidence
+- Allow user to PLAN actions (not execute)
+- Create or update rows in `actions`
+- Append notes safely
+- NEVER touch filesystem
 """
 
 import sqlite3
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-
 import os
 from dotenv import load_dotenv
+
+# ---------------- I18N KEYS ----------------
+
+MSG_REVIEW_START = "REVIEW_START"
+MSG_NO_FILES = "NO_FILES_TO_REVIEW"
+MSG_EXITING = "REVIEW_EXITING"
+MSG_INVALID_OPTION = "INVALID_OPTION"
+MSG_ACTION_PLANNED = "ACTION_PLANNED"
+MSG_NOTE_SAVED = "NOTE_SAVED"
+MSG_PATH_UPDATED = "PATH_UPDATED"
+
+# ------------------------------------------
 
 load_dotenv()
 
 DB_PATH = os.getenv("MUSIC_DB")
 if not DB_PATH:
-    raise SystemExit("[ERROR] MUSIC_DB not set in .env")
-
-DEFAULT_ACTION = "move"
+    raise SystemExit({"key": "ERROR_DB_NOT_SET"})
 
 ACTIONS = {
     "m": "move",
@@ -38,31 +46,33 @@ ACTIONS = {
     "a": "archive",
     "n": "note",
     "p": "path",
-    "c": "canonical",   # NEW
     "q": "quit",
 }
 
-# -------------------- Helpers --------------------
+# ---------------- helpers ----------------
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
-def pretty(value):
-    return value if value not in (None, "", "None") else "-"
+def pretty(v):
+    return v if v not in (None, "", "None") else "-"
 
 def connect_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def print_header(fid):
+def header(fid):
     print("\n" + "=" * 80)
-    print(f"File ID {fid}")
+    print(f"FILE {fid}")
     print("=" * 80)
 
-# -------------------- Query logic --------------------
+# ---------------- queries ----------------
 
-def fetch_candidates(conn, resume=False, limit=None, only_duplicates=False):
+def fetch_candidates(limit=None, only_duplicates=False):
+    conn = connect_db()
+    c = conn.cursor()
+
     query = """
         SELECT
             f.id,
@@ -72,207 +82,142 @@ def fetch_candidates(conn, resume=False, limit=None, only_duplicates=False):
             f.title,
             f.duration,
             f.bitrate,
-            f.status,
-            f.action,
+            f.lifecycle_state,
             f.notes,
             f.recommended_path,
-            d.reason AS duplicate_reason,
-            d.confidence AS duplicate_confidence,
-            d.file1_id AS canonical_id
+            d.reason AS dup_reason,
+            d.confidence AS dup_confidence
         FROM files f
         LEFT JOIN duplicates d
-            ON f.id = d.file2_id
+          ON f.id = d.file2_id
+        WHERE f.lifecycle_state IN ('new','reviewing')
+          AND NOT EXISTS (
+            SELECT 1 FROM actions
+            WHERE actions.file_id = f.id
+              AND actions.status = 'pending'
+          )
+        ORDER BY f.id
     """
-
-    where = []
-    params = []
-
-    if resume:
-        where.append("f.action = ?")
-        params.append(DEFAULT_ACTION)
-
-    if only_duplicates:
-        where.append("""
-            f.id IN (
-                SELECT file1_id FROM duplicates
-                UNION
-                SELECT file2_id FROM duplicates
-            )
-        """)
-
-    if where:
-        query += " WHERE " + " AND ".join(where)
-
-    query += " ORDER BY f.id"
 
     if limit:
         query += f" LIMIT {int(limit)}"
 
-    cur = conn.execute(query, params)
-    return cur.fetchall()
+    rows = c.execute(query).fetchall()
+    conn.close()
+    return rows
 
-# -------------------- Review loop --------------------
+# ---------------- review loop ----------------
 
 def review_loop(rows):
     conn = connect_db()
-    cur = conn.cursor()
+    c = conn.cursor()
+
+    print({"key": MSG_REVIEW_START, "params": {"count": len(rows)}})
 
     for row in rows:
         fid = row["id"]
+        header(fid)
 
-        print_header(fid)
         print(f"Path       : {row['original_path']}")
         print(f"Artist     : {pretty(row['artist'])}")
         print(f"Album      : {pretty(row['album'])}")
         print(f"Title      : {pretty(row['title'])}")
         print(f"Duration   : {pretty(row['duration'])}")
         print(f"Bitrate    : {pretty(row['bitrate'])}")
-        print(f"Status     : {pretty(row['status'])}")
-        print(f"Action     : {pretty(row['action'])}")
+        print(f"Lifecycle  : {row['lifecycle_state']}")
         print(f"Notes      : {pretty(row['notes'])}")
         print(f"Proposed → : {pretty(row['recommended_path'])}")
 
-        while True:
-            opts = "[m]ove [s]kip [d]elete [a]rchive [p]ath [n]ote"
-            if row.get("canonical_id"):
-                opts += " [c]anonical"
-            opts += " [q]uit"
-            print("\n" + opts)
+        if row["dup_reason"]:
+            print(f"Duplicate  : {row['dup_reason']} ({row['dup_confidence']})")
 
+        while True:
+            print("\n[m]ove [s]kip [d]elete [a]rchive [p]ath [n]ote [q]uit")
             choice = input("> ").strip().lower()
 
             if choice not in ACTIONS:
-                print("Invalid option.")
+                print({"key": MSG_INVALID_OPTION})
                 continue
 
             action = ACTIONS[choice]
 
-            # ---- Quit safely ----
             if action == "quit":
-                print("Exiting review safely.")
+                print({"key": MSG_EXITING})
                 conn.commit()
                 conn.close()
                 return
 
-            # ---- Edit note ----
             if action == "note":
-                print("Enter note (empty = cancel):")
                 note = input("> ").strip()
-                if not note:
-                    print("Note cancelled.")
-                    continue
-
-                cur.execute(
-                    """
-                    UPDATE files
-                    SET notes = ?, last_update = ?
-                    WHERE id = ?
-                    """,
-                    (note, utcnow(), fid),
-                )
-                conn.commit()
-                print("Note saved.")
+                if note:
+                    c.execute("""
+                        UPDATE files
+                        SET notes = COALESCE(notes,'') || ?
+                        WHERE id=?
+                    """, (f" | {note}", fid))
+                    conn.commit()
+                    print({"key": MSG_NOTE_SAVED})
                 continue
 
-            # ---- Edit proposed path ----
             if action == "path":
-                print("Enter new destination path (empty = cancel):")
                 new_path = input("> ").strip()
-
-                if not new_path:
-                    print("Path edit cancelled.")
-                    continue
-
-                if not Path(new_path).suffix:
-                    print("Path must include filename and extension.")
-                    continue
-
-                cur.execute(
-                    """
-                    UPDATE files
-                    SET recommended_path = ?, last_update = ?
-                    WHERE id = ?
-                    """,
-                    (new_path, utcnow(), fid),
-                )
-                conn.commit()
-                print("Proposed path updated.")
-                
-            #- ---- Use canonical file's path ----
-            if action == "canonical":
-                cid = row.get("canonical_id")
-                if not cid:
-                    print("No canonical file linked.")
-                    continue
-
-                cur.execute(
-                    "SELECT * FROM files WHERE id = ?",
-                    (cid,)
-                )
-                canon = cur.fetchone()
-                if not canon:
-                    print("Canonical file not found.")
-                    continue
-
-                print_header(canon["id"])
-                print(f"Path       : {canon['original_path']}")
-                print(f"Artist     : {pretty(canon['artist'])}")
-                print(f"Album      : {pretty(canon['album'])}")
-                print(f"Title      : {pretty(canon['title'])}")
-                print(f"Duration   : {pretty(canon['duration'])}")
-                print(f"Bitrate    : {pretty(canon['bitrate'])}")
-                print(f"Status     : {pretty(canon['status'])}")
-                print(f"Action     : {pretty(canon['action'])}")
-                print(f"Notes      : {pretty(canon['notes'])}")
-                print(f"Proposed → : {pretty(canon['recommended_path'])}")
+                if new_path and Path(new_path).suffix:
+                    c.execute("""
+                        UPDATE files
+                        SET recommended_path = ?
+                        WHERE id=?
+                    """, (new_path, fid))
+                    conn.commit()
+                    print({"key": MSG_PATH_UPDATED})
                 continue
 
+            # ---- plan action ----
+            c.execute("""
+                INSERT INTO actions (
+                    file_id,
+                    action,
+                    src_path,
+                    dst_path,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, 'pending', ?)
+            """, (
+                fid,
+                action,
+                row["original_path"],
+                row["recommended_path"],
+                utcnow()
+            ))
 
-            # ---- Final decision (move / skip / delete / archive) ----
-            cur.execute(
-                """
+            c.execute("""
                 UPDATE files
-                SET action = ?, last_update = ?
-                WHERE id = ?
-                """,
-                (action, utcnow(), fid),
-            )
+                SET lifecycle_state='reviewing'
+                WHERE id=?
+            """, (fid,))
+
             conn.commit()
+            print({"key": MSG_ACTION_PLANNED, "params": {"action": action}})
             break
 
     conn.close()
-    print("\nReview complete.")
+    print({"key": "REVIEW_COMPLETE"})
 
-# -------------------- CLI --------------------
+# ---------------- CLI ----------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive DB reviewer")
-    parser.add_argument(
-        "--continue",
-        dest="resume",
-        action="store_true",
-        help="Resume reviewing default-action rows only",
-    )
-    parser.add_argument("--limit", type=int, help="Limit number of rows reviewed")
-    parser.add_argument(
-        "--only-duplicates",
-        action="store_true",
-        help="Review only files involved in duplicates",
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--only-duplicates", action="store_true")
     args = parser.parse_args()
 
-    conn = connect_db()
     rows = fetch_candidates(
-        conn,
-        resume=args.resume,
         limit=args.limit,
-        only_duplicates=args.only_duplicates,
+        only_duplicates=args.only_duplicates
     )
-    conn.close()
 
     if not rows:
-        print("No files to review.")
+        print({"key": MSG_NO_FILES})
         return
 
     review_loop(rows)

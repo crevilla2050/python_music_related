@@ -2,205 +2,184 @@
 """
 review_csv.py
 
-CSV-based bulk reviewer for music_consolidation.db
+CSV-based human review layer for Pedro Organiza.
 
-Features:
-- Export DB rows to CSV with root + tree-path separation
-- Import edited CSV back into SQLite
-- Supports disk migration via root editing
-- Creates missing directories (logged in notes)
-- Safe for large libraries (30k+ rows)
+Responsibilities:
+- Export file rows for offline review
+- Import reviewed decisions as planned actions
+- NEVER mutates filesystem
+- NEVER applies actions
+- Writes ONLY to `actions` table
+
+Layer: Review / Planning
 """
 
 import sqlite3
 import csv
 import argparse
+import os
 from pathlib import Path
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-DB_PATH = "music_consolidation.db"
+# ---------------- I18N KEYS ----------------
+
+MSG_DB_NOT_SET = "ERROR_DB_NOT_SET"
+MSG_EXPORT_DONE = "CSV_EXPORT_DONE"
+MSG_IMPORT_DONE = "CSV_IMPORT_DONE"
+MSG_INVALID_ACTION = "INVALID_ACTION_SKIPPED"
+MSG_NO_ACTIONS = "NO_ACTIONS_IMPORTED"
+
+# ------------------------------------------
+
+load_dotenv()
+
+DB_PATH = os.getenv("MUSIC_DB")
 CSV_PATH = "review.csv"
 
-VALID_ACTIONS = {"move", "skip", "delete", "archive"}
-DEFAULT_ACTION = "move"
+VALID_ACTIONS = {"move", "archive", "delete", "skip"}
 
 
-# -------------------- helpers --------------------
+# ---------------- helpers ----------------
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
 def connect_db():
-    return sqlite3.connect(DB_PATH)
+    if not DB_PATH:
+        raise SystemExit({"key": MSG_DB_NOT_SET})
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def split_path(full_path: str | None, root_dir: str | None):
-    if not full_path:
-        return "", ""
+# ---------------- export ----------------
 
-    full = Path(full_path).resolve()
-
-    if root_dir:
-        root = Path(root_dir).expanduser().resolve()
-        try:
-            rel = full.relative_to(root)
-            # current_root should be the provided fixed root, tree path the variable part
-            return str(root), str(rel)
-        except ValueError:
-            # Not under the provided root: still return the fixed root and the full path as variable part
-            return str(root), str(full)
-
-    # fallback if no root_dir: return parent as root and filename as tree path
-    return str(full.parent), full.name
-
-
-
-def join_path(root: str, tree: str):
-    if not root:
-        return tree
-    return str(Path(root) / tree)
-
-
-# -------------------- export --------------------
-
-def export_csv(root_dir: str | None, only_pending=False):
-    # Ensure DB file exists to avoid confusing sqlite auto-create behavior
-    db_file = Path(DB_PATH)
-    if not db_file.exists():
-        print(f"[!] Database not found: {DB_PATH}\n    Run the analysis to create the DB (e.g. consolidate_music.py --src <SRC> --lib <LIB>)")
-        return
-
+def export_csv(only_new=True):
     conn = connect_db()
     c = conn.cursor()
 
     query = """
-        SELECT id, original_path, recommended_path, action, status, notes
+        SELECT
+            id,
+            original_path,
+            recommended_path
         FROM files
     """
 
-    try:
-        if only_pending:
-            query += " WHERE action = ?"
-            c.execute(query, (DEFAULT_ACTION,))
-        else:
-            c.execute(query)
-    except sqlite3.OperationalError as e:
-        # Provide a helpful error when the expected schema/table doesn't exist
-        if "no such table" in str(e).lower():
-            print(f"[!] The database exists but does not contain the expected table 'files'.\n    You may need to run the analysis step to populate the DB (consolidate_music.py).")
-            conn.close()
-            return
-        raise
+    if only_new:
+        query += " WHERE lifecycle_state='new'"
 
-    rows = c.fetchall()
+    rows = c.execute(query).fetchall()
     conn.close()
 
     with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "id",
-            "action",
-            "status",
-            "current_root",
-            "current_tree_path",
-            "proposed_root",
-            "proposed_tree_path",
+            "file_id",
+            "current_path",
+            "recommended_path",
+            "proposed_action",
             "notes"
         ])
 
-        for fid, orig, rec, action, status, notes in rows:
-            cr, ct = split_path(orig, root_dir)
-            pr, pt = split_path(rec if rec else orig, root_dir)
-
-            # Ensure filename is only at end of tree path
-            ct = str(Path(ct))
-            pt = str(Path(pt))
-
+        for r in rows:
             writer.writerow([
-                fid,
-                action or DEFAULT_ACTION,
-                status,
-                cr,
-                ct,
-                pr,
-                pt,
-                notes or ""
+                r["id"],
+                r["original_path"],
+                r["recommended_path"] or "",
+                "move",
+                ""
             ])
 
-    print(f"[✓] CSV exported to {CSV_PATH}")
+    print({
+        "key": MSG_EXPORT_DONE,
+        "params": {"path": CSV_PATH, "count": len(rows)}
+    })
 
 
-# -------------------- import --------------------
+# ---------------- import ----------------
 
-def import_csv(create_dirs=True):
+def import_csv():
     conn = connect_db()
     c = conn.cursor()
+
+    created = 0
 
     with open(CSV_PATH, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
         for row in reader:
-            fid = int(row["id"])
-            action = row["action"].strip().lower()
+            fid = int(row["file_id"])
+            action = row["proposed_action"].strip().lower()
             notes = row.get("notes", "").strip()
 
             if action not in VALID_ACTIONS:
-                print(f"[!] Skipping ID {fid}: invalid action '{action}'")
+                print({
+                    "key": MSG_INVALID_ACTION,
+                    "params": {"id": fid, "action": action}
+                })
                 continue
 
-            proposed_path = join_path(
-                row["proposed_root"].strip(),
-                row["proposed_tree_path"].strip()
-            )
+            # Do not overwrite existing pending actions
+            exists = c.execute("""
+                SELECT 1 FROM actions
+                WHERE file_id=? AND status='pending'
+            """, (fid,)).fetchone()
 
-            note_log = []
-
-            if create_dirs and proposed_path:
-                target_dir = Path(proposed_path).parent
-                if not target_dir.exists():
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    note_log.append(f"created_dir:{target_dir}")
-
-            if notes:
-                note_log.append(notes)
-
-            final_notes = " | ".join(note_log)
+            if exists:
+                continue
 
             c.execute("""
-                UPDATE files
-                SET action = ?, recommended_path = ?, notes = ?, last_update = ?
-                WHERE id = ?
+                INSERT INTO actions (
+                    file_id,
+                    action,
+                    src_path,
+                    dst_path,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, 'pending', ?)
             """, (
+                fid,
                 action,
-                proposed_path,
-                final_notes,
-                utcnow(),
-                fid
+                row["current_path"],
+                row["recommended_path"] or None,
+                utcnow()
             ))
+
+            if notes:
+                c.execute("""
+                    UPDATE files
+                    SET notes = COALESCE(notes,'') || ?
+                    WHERE id=?
+                """, (f" | csv:{notes}", fid))
+
+            created += 1
 
     conn.commit()
     conn.close()
-    print("[✓] CSV changes applied to database")
+
+    print({
+        "key": MSG_IMPORT_DONE,
+        "params": {"count": created}
+    })
 
 
-# -------------------- CLI --------------------
+# ---------------- CLI ----------------
 
 def main():
-    parser = argparse.ArgumentParser(description="CSV reviewer for music consolidation DB")
-    parser.add_argument("root", nargs="?", help="Base root directory for path splitting (positional)")
-    parser.add_argument("--export", action="store_true", help="Export DB to CSV")
-    parser.add_argument("--import", dest="do_import", action="store_true", help="Import CSV into DB")
-    parser.add_argument("--root-dir", help="Base root directory for path splitting")
-    parser.add_argument("--only-pending", action="store_true", help="Export only default-action rows")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--export", action="store_true")
+    parser.add_argument("--import", dest="do_import", action="store_true")
+    parser.add_argument("--all", action="store_true",
+                        help="Export all rows (default: only new)")
 
     args = parser.parse_args()
 
-    # Prefer positional `root` if provided, otherwise fall back to `--root-dir`
-    chosen_root = args.root if args.root else args.root_dir
-
     if args.export:
-        export_csv(chosen_root, args.only_pending)
+        export_csv(only_new=not args.all)
     elif args.do_import:
         import_csv()
     else:
