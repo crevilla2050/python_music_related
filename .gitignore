@@ -90,6 +90,12 @@ music-ui/node_modules/
 music-ui/build/
 music-ui/dist/
 
+#Database
+/databases/*.db
+*.db
+*.sqlite
+*.sqlite3
+
 # Logs
 *.log
 
