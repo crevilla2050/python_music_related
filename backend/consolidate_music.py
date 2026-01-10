@@ -131,8 +131,8 @@ def resolve_database_path(cli_value=None):
     raw = cli_value or os.getenv("MUSIC_DB")
     if not raw:
         raise RuntimeError({
-            "key": MSG_DB_NOT_PROVIDED if key == "MUSIC_DB" else MSG_LIB_NOT_PROVIDED,
-            "params": {"key": key}
+            "key": MSG_DB_NOT_PROVIDED,
+            "params": {"key": "MUSIC_DB"}
         })
 
     p = Path(raw)
@@ -145,7 +145,7 @@ def resolve_database_path(cli_value=None):
 
     _update_env("MUSIC_DB", str(p))
     return str(p)
-    # return resolve_env_path("MUSIC_DB", cli_value)
+
 
 # ================= UTILITIES =================
 

@@ -24,12 +24,28 @@ from dotenv import load_dotenv
 # ---------------- I18N KEYS ----------------
 
 MSG_REVIEW_START = "REVIEW_START"
+MSG_REVIEW_COMPLETE = "REVIEW_COMPLETE"
 MSG_NO_FILES = "NO_FILES_TO_REVIEW"
 MSG_EXITING = "REVIEW_EXITING"
 MSG_INVALID_OPTION = "INVALID_OPTION"
 MSG_ACTION_PLANNED = "ACTION_PLANNED"
 MSG_NOTE_SAVED = "NOTE_SAVED"
 MSG_PATH_UPDATED = "PATH_UPDATED"
+
+MSG_FIELD_PATH = "FIELD_PATH"
+MSG_FIELD_ARTIST = "FIELD_ARTIST"
+MSG_FIELD_ALBUM = "FIELD_ALBUM"
+MSG_FIELD_TITLE = "FIELD_TITLE"
+MSG_FIELD_DURATION = "FIELD_DURATION"
+MSG_FIELD_BITRATE = "FIELD_BITRATE"
+MSG_FIELD_LIFECYCLE = "FIELD_LIFECYCLE"
+MSG_FIELD_NOTES = "FIELD_NOTES"
+MSG_FIELD_PROPOSED = "FIELD_PROPOSED"
+MSG_FIELD_DUPLICATE = "FIELD_DUPLICATE"
+
+MSG_PROMPT_ACTIONS = "PROMPT_ACTIONS"
+MSG_PROMPT_NOTE = "PROMPT_NOTE"
+MSG_PROMPT_PATH = "PROMPT_PATH"
 
 # ------------------------------------------
 
@@ -67,6 +83,12 @@ def header(fid):
     print(f"FILE {fid}")
     print("=" * 80)
 
+def emit(key, params=None):
+    if params:
+        print({"key": key, "params": params})
+    else:
+        print({"key": key})
+
 # ---------------- queries ----------------
 
 def fetch_candidates(limit=None, only_duplicates=False):
@@ -96,8 +118,18 @@ def fetch_candidates(limit=None, only_duplicates=False):
             WHERE actions.file_id = f.id
               AND actions.status = 'pending'
           )
-        ORDER BY f.id
     """
+
+    if only_duplicates:
+        query += """
+          AND EXISTS (
+            SELECT 1 FROM duplicates
+            WHERE duplicates.file1_id = f.id
+               OR duplicates.file2_id = f.id
+          )
+        """
+
+    query += " ORDER BY f.id"
 
     if limit:
         query += f" LIMIT {int(limit)}"
@@ -112,42 +144,46 @@ def review_loop(rows):
     conn = connect_db()
     c = conn.cursor()
 
-    print({"key": MSG_REVIEW_START, "params": {"count": len(rows)}})
+    emit(MSG_REVIEW_START, {"count": len(rows)})
 
     for row in rows:
         fid = row["id"]
         header(fid)
 
-        print(f"Path       : {row['original_path']}")
-        print(f"Artist     : {pretty(row['artist'])}")
-        print(f"Album      : {pretty(row['album'])}")
-        print(f"Title      : {pretty(row['title'])}")
-        print(f"Duration   : {pretty(row['duration'])}")
-        print(f"Bitrate    : {pretty(row['bitrate'])}")
-        print(f"Lifecycle  : {row['lifecycle_state']}")
-        print(f"Notes      : {pretty(row['notes'])}")
-        print(f"Proposed → : {pretty(row['recommended_path'])}")
+        emit(MSG_FIELD_PATH, {"value": row["original_path"]})
+        emit(MSG_FIELD_ARTIST, {"value": pretty(row["artist"])})
+        emit(MSG_FIELD_ALBUM, {"value": pretty(row["album"])})
+        emit(MSG_FIELD_TITLE, {"value": pretty(row["title"])})
+        emit(MSG_FIELD_DURATION, {"value": pretty(row["duration"])})
+        emit(MSG_FIELD_BITRATE, {"value": pretty(row["bitrate"])})
+        emit(MSG_FIELD_LIFECYCLE, {"value": row["lifecycle_state"]})
+        emit(MSG_FIELD_NOTES, {"value": pretty(row["notes"])})
+        emit(MSG_FIELD_PROPOSED, {"value": pretty(row["recommended_path"])})
 
         if row["dup_reason"]:
-            print(f"Duplicate  : {row['dup_reason']} ({row['dup_confidence']})")
+            emit(MSG_FIELD_DUPLICATE, {
+                "reason": row["dup_reason"],
+                "confidence": row["dup_confidence"],
+            })
 
         while True:
-            print("\n[m]ove [s]kip [d]elete [a]rchive [p]ath [n]ote [q]uit")
+            emit(MSG_PROMPT_ACTIONS)
             choice = input("> ").strip().lower()
 
             if choice not in ACTIONS:
-                print({"key": MSG_INVALID_OPTION})
+                emit(MSG_INVALID_OPTION)
                 continue
 
             action = ACTIONS[choice]
 
             if action == "quit":
-                print({"key": MSG_EXITING})
+                emit(MSG_EXITING)
                 conn.commit()
                 conn.close()
                 return
 
             if action == "note":
+                emit(MSG_PROMPT_NOTE)
                 note = input("> ").strip()
                 if note:
                     c.execute("""
@@ -156,10 +192,11 @@ def review_loop(rows):
                         WHERE id=?
                     """, (f" | {note}", fid))
                     conn.commit()
-                    print({"key": MSG_NOTE_SAVED})
+                    emit(MSG_NOTE_SAVED)
                 continue
 
             if action == "path":
+                emit(MSG_PROMPT_PATH)
                 new_path = input("> ").strip()
                 if new_path and Path(new_path).suffix:
                     c.execute("""
@@ -168,7 +205,7 @@ def review_loop(rows):
                         WHERE id=?
                     """, (new_path, fid))
                     conn.commit()
-                    print({"key": MSG_PATH_UPDATED})
+                    emit(MSG_PATH_UPDATED)
                 continue
 
             # ---- plan action ----
@@ -197,11 +234,11 @@ def review_loop(rows):
             """, (fid,))
 
             conn.commit()
-            print({"key": MSG_ACTION_PLANNED, "params": {"action": action}})
+            emit(MSG_ACTION_PLANNED, {"action": action})
             break
 
     conn.close()
-    print({"key": "REVIEW_COMPLETE"})
+    emit(MSG_REVIEW_COMPLETE)
 
 # ---------------- CLI ----------------
 
@@ -217,7 +254,7 @@ def main():
     )
 
     if not rows:
-        print({"key": MSG_NO_FILES})
+        emit(MSG_NO_FILES)
         return
 
     review_loop(rows)

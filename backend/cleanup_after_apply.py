@@ -4,29 +4,13 @@ backend/cleanup_after_apply.py
 
 Post-apply cleanup helper for Pedro Organiza.
 
-This module scans a target music library tree for directories that are
-safe-to-delete according to conservative rules (either empty, or
-containing only small image files such as thumbnails). It does not
-perform destructive actions during scanning: instead it inserts
-`delete_dir` actions into the application's `actions` table so that a
-separate execution step can perform removals in a controlled way.
+Scans a target library tree for directories safe to delete
+(empty or containing only small disposable images).
 
-Design principles:
-- Conservative detection to avoid accidental data loss
-- Separate planning (DB actions) from execution
-- Support `--dry-run` to surface candidates without mutating state
+This module PLANS deletions by inserting `delete_dir` actions
+and optionally EXECUTES them in a controlled manner.
 
-Assumptions:
-- A SQLite DB with an `actions` table exists; rows inserted here will
-  be processed by `execute_cleanup` which expects columns like
-  `id`, `action`, `src_path`, `status`, etc.
-
-This file contains three main responsibilities:
-1. Identify deletable directories (`scan_deletable_dirs`).
-2. Plan deletions by inserting `delete_dir` actions into the DB
-    (`plan_cleanup_actions`).
-3. Execute pending delete actions, removing small images and empty
-    directories (`execute_cleanup`).
+Layer: Planning + Optional Execution
 """
 
 import argparse
@@ -42,6 +26,7 @@ MSG_MODE_CONFLICT = "CLEANUP_MODE_CONFLICT"
 MSG_SCAN_RESULT = "CLEANUP_SCAN_RESULT"
 MSG_CANDIDATE_DIR = "CLEANUP_CANDIDATE_DIR"
 MSG_PLANNED_AND_REMOVED = "CLEANUP_PLANNED_AND_REMOVED"
+MSG_SKIPPED_DIRS = "CLEANUP_SKIPPED_DIRS"
 
 # ====================================================
 
@@ -53,22 +38,12 @@ MAX_IMAGE_SIZE = 100 * 1024  # 100 KB
 # ---------------- HELPERS ----------------
 
 def utcnow():
-    """Return current UTC time as an ISO-8601 string.
-
-    Used when recording action creation and application timestamps in
-    the database so entries are auditable.
-    """
+    """Return current UTC time as ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def is_small_image(path: Path) -> bool:
-    """Return True when `path` is a small image file we consider trash.
-
-    The check is intentionally conservative: only files with known image
-    extensions are considered, and we silently treat stat errors as
-    non-matching so the scanner does not crash on locked or unreadable
-    files.
-    """
+    """Return True if path is a small disposable image file."""
     if path.suffix.lower() not in IMAGE_EXTS:
         return False
     try:
@@ -78,69 +53,60 @@ def is_small_image(path: Path) -> bool:
 
 
 def directory_is_deletable(path: Path) -> bool:
-    """Return True when `path` is safe to delete.
-
-    A directory is deletable when either:
-    - it is empty, or
-    - it contains no subdirectories and all files are small images we
-      consider disposable (thumbnails, cover caches).
-
-    We ignore directories we cannot read and treat them as non-deletable
-    to avoid unintended removals.
-    """
+    """Return True if directory is empty or contains only small images."""
     try:
         entries = list(path.iterdir())
     except Exception:
-        # Permission errors or transient filesystem issues => skip
         return False
 
     if not entries:
-        return True  # empty
+        return True
 
     for item in entries:
-        # If there are subdirectories, be conservative and don't delete
         if item.is_dir():
-            continue
-        # If any non-small-image file exists, the directory is not deletable
+            return False
         if not is_small_image(item):
             return False
 
-    # All files (if any) are small images
     return True
 
 
 # ---------------- CORE LOGIC ----------------
 
 def scan_deletable_dirs(root: Path):
-    """Walk `root` (bottom-up) and return a list of deletable directories.
-
-    We walk bottom-up (`topdown=False`) so that inner empty directories are
-    discovered before their parents — this allows the caller to plan the
-    removal of nested directories in a single pass without needing to
-    re-scan after deletions.
-    """
+    """Bottom-up scan returning (candidates, skipped_count)."""
     candidates = []
+    skipped = 0
 
     for current, _, _ in os.walk(root, topdown=False):
         p = Path(current)
         if directory_is_deletable(p):
             candidates.append(p)
+        else:
+            skipped += 1
 
-    return candidates
+    return candidates, skipped
 
 
 def plan_cleanup_actions(db_path: Path, directories):
-    """Insert `delete_dir` actions into the DB for each directory.
-
-    Returns the number of planned actions. The actions are inserted with
-    `status='pending'` and can later be picked up by `execute_cleanup`.
-    """
+    """Insert delete_dir actions, avoiding duplicates."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
 
     planned = 0
 
     for d in directories:
+        # Prevent duplicate pending delete_dir actions
+        exists = c.execute("""
+            SELECT 1 FROM actions
+            WHERE action='delete_dir'
+              AND src_path=?
+              AND status='pending'
+        """, (str(d),)).fetchone()
+
+        if exists:
+            continue
+
         c.execute("""
             INSERT INTO actions (
                 file_id,
@@ -167,13 +133,7 @@ def plan_cleanup_actions(db_path: Path, directories):
 
 
 def execute_cleanup(db_path: Path):
-    """Execute pending `delete_dir` actions from the DB.
-
-    For each pending action we remove small images inside the directory
-    and attempt to rmdir the directory if it is empty afterwards. Each
-    action is marked `applied` on success or `error` with an error text on
-    failure so the system can audit or retry later.
-    """
+    """Execute pending delete_dir actions safely."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
 
@@ -191,14 +151,10 @@ def execute_cleanup(db_path: Path):
             p = Path(src_path)
 
             if p.exists():
-                # Remove small image files only. We intentionally avoid
-                # recursing into subdirectories here — planning should
-                # have already considered nested structure.
                 for item in p.iterdir():
                     if item.is_file() and is_small_image(item):
                         item.unlink()
 
-                # Attempt to remove the directory if empty
                 if not any(p.iterdir()):
                     p.rmdir()
 
@@ -211,7 +167,6 @@ def execute_cleanup(db_path: Path):
             removed += 1
 
         except Exception as e:
-            # Persist the error so callers/operators can inspect failures
             c.execute("""
                 UPDATE actions
                 SET status='error',
@@ -235,7 +190,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Mutually exclusive modes: cannot apply and dry-run simultaneously
     if args.apply and args.dry_run:
         raise SystemExit(MSG_MODE_CONFLICT)
 
@@ -245,14 +199,16 @@ def main():
     if not target.is_dir():
         raise SystemExit(MSG_INVALID_TARGET)
 
-    # Discover candidate directories conservatively
-    candidates = scan_deletable_dirs(target)
+    candidates, skipped = scan_deletable_dirs(target)
 
-    # If requested, only print the scan results and do not mutate state.
     if args.dry_run or not args.apply:
         print({
             "key": MSG_SCAN_RESULT,
             "params": {"count": len(candidates)}
+        })
+        print({
+            "key": MSG_SKIPPED_DIRS,
+            "params": {"count": skipped}
         })
         for d in candidates:
             print({
@@ -261,9 +217,6 @@ def main():
             })
         return
 
-    # Plan (insert DB actions) then execute them immediately. The split
-    # exists so other orchestration could review or batch actions between
-    # planning and execution if desired.
     planned = plan_cleanup_actions(db_path, candidates)
     removed = execute_cleanup(db_path)
 
@@ -278,3 +231,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ---------------- API SNIPPETS ----------------

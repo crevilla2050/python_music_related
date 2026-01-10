@@ -35,15 +35,18 @@ MSG_NO_ACTIONS = "NO_ACTIONS_IMPORTED"
 load_dotenv()
 
 DB_PATH = os.getenv("MUSIC_DB")
-CSV_PATH = "review.csv"
 
 VALID_ACTIONS = {"move", "archive", "delete", "skip"}
-
 
 # ---------------- helpers ----------------
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
+
+
+def default_csv_path() -> Path:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return Path(f"review_{ts}.csv")
 
 
 def connect_db():
@@ -56,7 +59,7 @@ def connect_db():
 
 # ---------------- export ----------------
 
-def export_csv(only_new=True):
+def export_csv(csv_path: Path, only_new=True):
     conn = connect_db()
     c = conn.cursor()
 
@@ -74,7 +77,7 @@ def export_csv(only_new=True):
     rows = c.execute(query).fetchall()
     conn.close()
 
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
             "file_id",
@@ -95,19 +98,19 @@ def export_csv(only_new=True):
 
     print({
         "key": MSG_EXPORT_DONE,
-        "params": {"path": CSV_PATH, "count": len(rows)}
+        "params": {"path": str(csv_path), "count": len(rows)}
     })
 
 
 # ---------------- import ----------------
 
-def import_csv():
+def import_csv(csv_path: Path):
     conn = connect_db()
     c = conn.cursor()
 
     created = 0
 
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
         for row in reader:
@@ -175,16 +178,21 @@ def main():
     parser.add_argument("--import", dest="do_import", action="store_true")
     parser.add_argument("--all", action="store_true",
                         help="Export all rows (default: only new)")
+    parser.add_argument("--csv-file",
+                        help="Path to CSV file (default: timestamped review_*.csv)")
 
     args = parser.parse_args()
 
+    csv_path = Path(args.csv_file) if args.csv_file else default_csv_path()
+
     if args.export:
-        export_csv(only_new=not args.all)
+        export_csv(csv_path, only_new=not args.all)
     elif args.do_import:
-        import_csv()
+        import_csv(csv_path)
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
     main()
+# ---------------- review ----------------
